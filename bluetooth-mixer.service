@@ -1,0 +1,17 @@
+[Unit]
+Description=Bluetooth Mixer (PipeWire control plane + web UI)
+Documentation=file://%h/.config/bluetooth-mixer/README.md
+After=pipewire.service wireplumber.service bluetooth.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bluetooth-mixer --port 8420
+Restart=on-failure
+RestartSec=3
+Nice=-5
+IOSchedulingClass=idle
+CPUWeight=50
+
+[Install]
+WantedBy=default.target

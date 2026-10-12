@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bluetooth Mixer</title>
+<style>
+:root{
+  --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#2b3444;
+  --fg:#e6edf3; --dim:#8b98a9; --accent:#3fb950; --blue:#58a6ff;
+  --warn:#d29922; --bad:#f85149;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:14px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{display:flex;align-items:center;gap:14px;padding:10px 16px;
+  background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5;flex-wrap:wrap}
+h1{font-size:15px;margin:0;letter-spacing:.4px}
+h2{font-size:12px;margin:0 0 8px;text-transform:uppercase;letter-spacing:.9px;color:var(--dim)}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--dim);flex:none}
+.dot.ok{background:var(--accent);box-shadow:0 0 8px var(--accent)}
+.dot.bad{background:var(--bad)}
+main{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(300px,1fr);gap:14px;padding:14px;align-items:start}
+@media(max-width:900px){main{grid-template-columns:1fr}}
+section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:14px}
+.row{display:flex;align-items:center;gap:10px;padding:7px 0;border-top:1px solid var(--line)}
+.row:first-of-type{border-top:0}
+.name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tag{font-size:10px;padding:1px 6px;border-radius:99px;border:1px solid var(--line);
+  color:var(--dim);background:var(--panel2);letter-spacing:.5px;flex:none}
+.tag.bt{color:var(--blue);border-color:#24486e}
+.tag.on{color:var(--accent);border-color:#1d4429}
+input[type=range]{width:130px;accent-color:var(--accent);flex:none}
+button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+  border-radius:6px;padding:4px 10px;cursor:pointer;font:inherit;font-size:12px}
+button:hover{border-color:#46536b;background:#232b3a}
+button.p{background:var(--accent);border-color:var(--accent);color:#04120a;font-weight:600}
+button.mute.on{background:var(--bad);border-color:var(--bad);color:#fff}
+button.solo.on{background:var(--warn);border-color:var(--warn);color:#231a03;font-weight:600}
+button:disabled{opacity:.45;cursor:not-allowed}
+.pill{font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums}
+.vol{font-size:11px;color:var(--dim);width:34px;text-align:right;font-variant-numeric:tabular-nums}
+.eqrow{display:flex;align-items:center;gap:10px;padding:5px 0}
+.eqrow label{width:62px;font-size:12px;color:var(--dim)}
+.eqrow input[type=range]{flex:1;width:auto}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+#toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#21262d;
+  border:1px solid var(--line);border-left:3px solid var(--blue);padding:8px 14px;
+  border-radius:6px;max-width:80vw;opacity:0;transition:opacity .25s;pointer-events:none;z-index:9}
+#toast.show{opacity:1}
+select,input[type=text]{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+  border-radius:6px;padding:4px 8px;font:inherit;font-size:12px}
+.empty{color:var(--dim);font-size:12px;padding:6px 0}
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="live"></span>
+  <h1>Bluetooth Mixer</h1>
+  <span class="pill" id="ver"></span>
+  <span class="pill" id="note"></span>
+</header>
+
+<main>
+<div>
+  <section>
+    <h2>Inputs &mdash; mixed together</h2>
+    <div id="inputs"></div>
+  </section>
+
+  <section>
+    <h2>Network / app sources</h2>
+    <div id="net"></div>
+    <div class="row">
+      <input type="text" id="netname" placeholder="RTP receiver name" style="flex:1;min-width:120px">
+      <button onclick="addNet()">Add receiver</button>
+    </div>
+    <p class="empty">Any PulseAudio client on your LAN (set <span class="mono">PULSE_SERVER=pi.local:4713</span>)
+       appears here automatically as an input. RTP receivers let you pull RTP audio from a phone over Wi-Fi.</p>
+  </section>
+
+  <section>
+    <h2>Bluetooth devices</h2>
+    <div id="bt"></div>
+    <div class="row">
+      <button id="scanbtn" onclick="scan()">Scan</button>
+      <button id="pwr" onclick="power()">Adapter</button>
+      <span class="pill" id="btdetail"></span>
+    </div>
+  </section>
+</div>
+
+<div>
+  <section>
+    <h2>Output</h2>
+    <div id="outputs"></div>
+    <div class="row" style="margin-top:8px">
+      <label style="width:74px">Master</label>
+      <input type="range" id="master" min="0" max="100" oninput="setMaster(this.value)">
+      <span class="vol" id="masterv">-</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>EQ &amp; limiter</h2>
+    <div id="eq"></div>
+    <div class="row">
+      <button id="lim" onclick="toggleLim()">Limiter: off</button>
+      <button onclick="send({cmd:'eq_reset'})">Reset EQ</button>
+      <span class="pill" id="eqstate"></span>
+    </div>
+  </section>
+
+  <section id="cardssec" style="display:none">
+    <h2>Hardware inputs</h2>
+    <div id="cards"></div>
+  </section>
+</div>
+</main>
+
+<div id="toast"></div>
+
+<script>
+let S = null;
+const $ = s => document.querySelector(s);
+const pct = v => v == null ? '-' : Math.round(v * 100) + '%';
+const esc = s => (s ?? '').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function send(o){ if(ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+
+let toastT;
+function toast(m){
+  $('#toast').textContent = m; $('#toast').classList.add('show');
+  clearTimeout(toastT); toastT = setTimeout(() => $('#toast').classList.remove('show'), 5000);
+}
+
+// ---- connections ----------------------------------------------------------
+function connect(){
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.onopen = () => setInterval(() => { if(ws.readyState !== 1) connect(); }, 4000);
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.toast) return toast(m.toast);
+    if (m.version !== undefined) render(m);
+  };
+}
+let ws;
+connect();
+
+// ---- rendering ------------------------------------------------------------
+const EQ = [['Low','120 Hz'],['Mid','500 Hz'],['Upper','3 kHz'],['Air','8 kHz']];
+$('#eq').innerHTML = EQ.map((l,i) =>
+  `<div class="eqrow"><label>${l[0]} · ${l[1]}</label>
+   <input type="range" min="-12" max="12" step="0.5" value="0" id="eq${i}">
+   <span class="vol" id="eqv${i}">0</span></div>`).join('');
+[0,1,2,3].forEach(i => $('#eq'+i).addEventListener('input', e => {
+  $('#eqv'+i).textContent = (+e.target.value).toFixed(1);
+  send({cmd:'eq', band:i, gain:+e.target.value});
+}));
+
+let dragging = false;
+addEventListener('pointerdown', () => dragging = true);
+addEventListener('pointerup', () => setTimeout(() => dragging = false, 1200));
+
+function render(s){
+  S = s;
+  $('#live').className = 'dot ' + (s.ok ? 'ok' : 'bad');
+  $('#ver').textContent = s.ok ? (s.version || '') : (s.error || 'pipewire unavailable');
+  $('#note').textContent = s.note || '';
+  $('#scanbtn').textContent = s.scanning ? 'Scanning…' : 'Scan';
+  $('#scanbtn').disabled = !!s.scanning;
+
+  // inputs
+  const ins = s.inputs || [];
+  $('#inputs').innerHTML = ins.length ? ins.map(n => `
+    <div class="row">
+      <span class="name" title="${esc(n.name)}">${esc(n.name)}</span>
+      ${n.bluetooth ? '<span class="tag bt">A2DP</span>' : ''}
+      <input type="range" min="0" max="100" value="${Math.round((n.vol ?? 1) * 100)}"
+             ${n.muted ? 'disabled' : ''} oninput="vol(${n.id},this)">
+      <span class="vol">${pct(n.vol)}</span>
+      <button class="mute ${n.muted ? 'on' : ''}" onclick="mute(${n.id},${!n.muted})">M</button>
+      <button class="solo ${n.solo ? 'on' : ''}" onclick="send({cmd:'solo',id:${n.id},on:${!n.solo}})">S</button>
+    </div>`).join('') : '<div class="empty">No inputs yet. Connect a Bluetooth phone or a USB/line-in device.</div>';
+
+  // outputs
+  const outs = s.outputs || [];
+  $('#outputs').innerHTML = outs.length ? outs.map(n => `
+    <div class="row">
+      <input type="radio" name="out" ${n.id === s.selected ? 'checked' : ''}
+             onchange="send({cmd:'output',id:${n.id}})">
+      <span class="name" title="${esc(n.name)}">${esc(n.name)}</span>
+      ${n.bluetooth ? '<span class="tag bt">A2DP</span>' : ''}
+      ${n.default ? '<span class="tag on">system default</span>' : ''}
+      <span class="vol">${pct(n.vol)}</span>
+    </div>`).join('') : '<div class="empty">No output sink available.</div>';
+  if (!dragging) { $('#master').value = Math.round((s.master ?? 1) * 100); $('#masterv').textContent = pct(s.master); }
+
+  // eq
+  if (!dragging) (s.eq || [0,0,0,0]).forEach((g,i) => {
+    const e = $('#eq'+i); if (e && document.activeElement !== e){ e.value = g; $('#eqv'+i).textContent = (+g).toFixed(1); }
+  });
+  $('#lim').textContent = 'Limiter: ' + (s.limiter ? 'on' : 'off');
+  $('#lim').className = s.limiter ? 'p' : '';
+  $('#eqstate').textContent = s.filter_live ? 'filter active' : 'filter not running';
+
+  renderBt(s.bluetooth);
+  renderNet(s.net);
+  renderCards(s.cards);
+}
+
+function renderBt(bt){
+  const a = bt && bt.adapter;
+  $('#pwr').textContent = a && a.powered ? 'Turn off' : 'Turn on';
+  $('#pwr').className = a && a.powered ? '' : 'p';
+  $('#btdetail').textContent = !bt || bt.error ? (bt && bt.error) || ''
+    : (a.name || 'adapter') + ' · ' + (a.mac || 'no controller') + ' · ' + (a.powered ? 'powered' : 'off');
+  if (!bt || bt.error) return;
+  const ds = Array.isArray(bt.devices) ? bt.devices : [];
+  $('#bt').innerHTML = ds.length ? ds.map(d => `
+    <div class="row">
+      <span class="name" title="${esc(d.addr)}">${esc(d.name)}</span>
+      <span class="tag">${esc(d.role || '—')}</span>
+      ${d.connected ? '<span class="tag on">connected</span>' : ''}
+      ${d.paired ? '<span class="tag">paired</span>' : ''}
+      ${d.connected
+        ? `<button onclick="btAct('disconnect','${d.addr}')">Disconnect</button>`
+        : (d.paired ? `<button class="p" onclick="btAct('connect','${d.addr}')">Connect</button>`
+                    : `<button onclick="btAct('trust','${d.addr}')">Trust</button>
+                       <button class="p" onclick="btAct('pair','${d.addr}')">Pair</button>`)}
+    </div>`).join('')
+    : `<div class="empty">${a.powered ? 'No devices known yet.' : 'Bluetooth adapter is powered off.'}</div>`;
+}
+
+function renderNet(n){
+  if (!Array.isArray(n)){ $('#net').innerHTML = `<div class="empty">${esc(n && n.error || 'RTP unavailable')}</div>`; return; }
+  $('#net').innerHTML = n.length ? n.map((x,i) => `
+    <div class="row"><span class="name">${esc(x.name)}</span>
+      <span class="tag">RTP session ${x.session}</span>
+      <button onclick="send({cmd:'net_remove',index:${i}})">Remove</button></div>`).join('')
+    : '<div class="empty">No RTP receivers. LAN PulseAudio clients still work without one.</div>';
+}
+
+function renderCards(c){
+  if (!Array.isArray(c) || !c.length){ $('#cardssec').style.display = 'none'; return; }
+  $('#cardssec').style.display = '';
+  $('#cards').innerHTML = c.map(k => `
+    <div class="row"><span class="name">${esc(k.name)}</span>
+      <select onchange="send({cmd:'profile',card:${k.id},profile:this.value})">
+        ${(k.profiles||[]).map(p => `<option ${p===k.profile?'selected':''}>${esc(p)}</option>`).join('')}
+      </select></div>`).join('');
+}
+
+// ---- actions --------------------------------------------------------------
+let volT = {};
+function vol(id, el){
+  const v = el.value / 100;
+  el.nextElementSibling.textContent = pct(v);
+  clearTimeout(volT[id]); volT[id] = setTimeout(() => send({cmd:'vol', id, vol:v}), 120);
+}
+const mute = (id,on) => send({cmd:'mute', id, on});
+const btAct = (action,addr) => send({cmd:'bt_action', action, addr});
+const scan  = () => send({cmd:'bt_scan'});
+const power = () => send({cmd:'bt_power', on: !(S && S.bluetooth && S.bluetooth.adapter && S.bluetooth.adapter.powered)});
+const setMaster = v => { $('#masterv').textContent = v + '%'; send({cmd:'master', vol: v/100}); };
+const toggleLim = () => S && send({cmd:'limiter', on: !S.limiter});
+function addNet(){
+  const el = $('#netname');
+  send({cmd:'net_add', name: el.value.trim() || 'net', session: (S && (S.net||[]).length || 0) + 1});
+  el.value = '';
+}
+</script>
+</body>
+</html>
