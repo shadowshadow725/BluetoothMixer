@@ -8,10 +8,13 @@ UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 echo "==> Installing audio / bluetooth packages"
 sudo apt-get update -qq
+# WirePlumber 0.5 folded the PulseAudio session policy into `wireplumber`
+# itself; the old `wireplumber-pulse` package no longer exists.
 sudo apt-get install -y --no-install-recommends \
-    pipewire wireplumber wireplumber-pulse pipewire-audio-client-libraries \
+    pipewire wireplumber pipewire-audio-client-libraries \
     bluez bluez-tools libspa-0.2-modules \
-    pulseaudio-utils swh-plugins
+    pulseaudio-utils \
+    libpipewire-0.3-dev pkg-config
 
 echo "==> Building bluetooth-mixer"
 cargo build --release || {

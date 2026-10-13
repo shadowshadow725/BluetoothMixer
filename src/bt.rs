@@ -78,7 +78,10 @@ pub async fn adapter() -> Result<Adapter> {
 }
 
 pub async fn devices() -> Result<Vec<Device>> {
-    let out = btc(&["--timeout".into(), "6".into(), "devices".into()], 10).await?;
+    // No `--timeout` here: it makes bluetoothctl sit and wait, which is only
+    // wanted for `scan`. Plain `devices` returns immediately and would
+    // otherwise stall the whole poll loop for its full timeout.
+    let out = btc(&["devices".into()], 6).await?;
     let addrs: Vec<String> = out
         .lines()
         .filter_map(|l| l.strip_prefix("Device "))
@@ -94,20 +97,24 @@ pub async fn devices() -> Result<Vec<Device>> {
 }
 
 pub async fn device_info(addr: &str) -> Device {
-    let kv = parse_kv(
-        &btc(&["info".into(), addr.into()], 6)
-            .await
-            .unwrap_or_default(),
-    );
+    let raw = btc(&["info".into(), addr.into()], 6)
+        .await
+        .unwrap_or_default();
+    let kv = parse_kv(&raw);
+
+    // A device lists a dozen UUIDs and they all share one key, so the map
+    // above only ever holds the last one. Scan the raw output instead, or a
+    // phone's "Audio Source" gets overwritten by whatever it lists last.
     let mut role = String::new();
-    for (k, v) in &kv {
-        if k == "uuid" {
-            let v = v.to_ascii_lowercase();
-            if v.contains("source") {
-                role = "source".into();
-            } else if v.contains("sink") && role.is_empty() {
-                role = "sink".into();
-            }
+    for line in raw.lines() {
+        let Some(uuid) = line.trim_start().strip_prefix("UUID:") else {
+            continue;
+        };
+        let uuid = uuid.to_ascii_lowercase();
+        if uuid.contains("source") {
+            role = "source".into();
+        } else if uuid.contains("sink") && role.is_empty() {
+            role = "sink".into();
         }
     }
     Device {
@@ -125,11 +132,25 @@ pub async fn device_info(addr: &str) -> Device {
 }
 
 pub async fn act(action: &str, addr: &str) -> String {
+    // Before pairing, the adapter has to be discoverable or the handset cannot
+    // find us in the first place.
+    if action == "pair" && !addr.is_empty() {
+        let _ = btc(&["discoverable".into(), "on".into()], 6).await;
+    }
     let (args, timeout): (Vec<String>, u64) = match action {
         "scan" => (
             vec!["--timeout".into(), "10".into(), "scan".into(), "on".into()],
             16,
         ),
+        // `bluetoothctl power` is an error without an explicit on/off argument.
+        "power on" => (vec!["power".into(), "on".into()], 8),
+        "power off" => (vec!["power".into(), "off".into()], 8),
+        // No `--agent` here on purpose. Our own agent (src/agent.rs) is already
+        // registered as the system default and confirms the passkey; letting
+        // bluetoothctl register a second one just makes it reject on our
+        // behalf. The long leash is for the user tapping "accept" on the
+        // handset.
+        "pair" if !addr.is_empty() => (vec!["pair".into(), addr.into()], 45),
         a if addr.is_empty() => (vec![a.to_string()], 8),
         a => (vec![a.to_string(), addr.to_string()], 12),
     };

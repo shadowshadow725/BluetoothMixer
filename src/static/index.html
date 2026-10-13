@@ -37,12 +37,11 @@ button:hover{border-color:#46536b;background:#232b3a}
 button.p{background:var(--accent);border-color:var(--accent);color:#04120a;font-weight:600}
 button.mute.on{background:var(--bad);border-color:var(--bad);color:#fff}
 button.solo.on{background:var(--warn);border-color:var(--warn);color:#231a03;font-weight:600}
+button.danger{color:var(--bad);border-color:#4a2226;padding:4px 8px;flex:none}
+button.danger:hover{background:var(--bad);border-color:var(--bad);color:#fff}
 button:disabled{opacity:.45;cursor:not-allowed}
 .pill{font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums}
 .vol{font-size:11px;color:var(--dim);width:34px;text-align:right;font-variant-numeric:tabular-nums}
-.eqrow{display:flex;align-items:center;gap:10px;padding:5px 0}
-.eqrow label{width:62px;font-size:12px;color:var(--dim)}
-.eqrow input[type=range]{flex:1;width:auto}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 #toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#21262d;
   border:1px solid var(--line);border-left:3px solid var(--blue);padding:8px 14px;
@@ -51,6 +50,9 @@ button:disabled{opacity:.45;cursor:not-allowed}
 select,input[type=text]{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
   border-radius:6px;padding:4px 8px;font:inherit;font-size:12px}
 .empty{color:var(--dim);font-size:12px;padding:6px 0}
+#meter{flex:1;height:8px;background:var(--panel2);border:1px solid var(--line);
+  border-radius:99px;overflow:hidden;min-width:80px}
+#meter i{display:block;height:100%;width:0;background:var(--accent);transition:width .08s linear}
 </style>
 </head>
 <body>
@@ -58,7 +60,6 @@ select,input[type=text]{background:var(--panel2);color:var(--fg);border:1px soli
   <span class="dot" id="live"></span>
   <h1>Bluetooth Mixer</h1>
   <span class="pill" id="ver"></span>
-  <span class="pill" id="note"></span>
 </header>
 
 <main>
@@ -87,6 +88,23 @@ select,input[type=text]{background:var(--panel2);color:var(--fg);border:1px soli
       <button id="pwr" onclick="power()">Adapter</button>
       <span class="pill" id="btdetail"></span>
     </div>
+    <div class="row" id="codecrow" style="display:none">
+      <span class="pill">Codec</span>
+      <span class="tag" id="codec">-</span>
+      <span class="pill">the phone picks this; BlueZ has no API to change it</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Bluetooth test tone</h2>
+    <div class="row">
+      <button id="tonebtn" class="p" onclick="playTone()">Play test tone on this device</button>
+      <span class="pill" id="tonestat">idle</span>
+    </div>
+    <p class="empty">Open this page on your <b>phone</b> and press play &mdash; the tone
+       streams to the Pi over Bluetooth, so the Pi can measure what the link
+       actually delivers. The segments are self-identifying: each starts with
+       N beeps (N = segment number) so a capture can be matched up exactly.</p>
   </section>
 </div>
 
@@ -99,16 +117,29 @@ select,input[type=text]{background:var(--panel2);color:var(--fg);border:1px soli
       <input type="range" id="master" min="0" max="100" oninput="setMaster(this.value)">
       <span class="vol" id="masterv">-</span>
     </div>
+    <div class="row">
+      <label style="width:74px">Gain</label>
+      <input type="range" id="gain" min="0" max="400" oninput="setGain(this.value)">
+      <span class="vol" id="gainv">-</span>
+    </div>
+    <p class="empty" id="gainhelp">Gain multiplies the master level. Above 100% the output is
+       boosted past unity, so expect clipping on loud material.</p>
   </section>
 
-  <section>
-    <h2>EQ &amp; limiter</h2>
-    <div id="eq"></div>
+  <section id="websec">
+    <h2>Web output</h2>
     <div class="row">
-      <button id="lim" onclick="toggleLim()">Limiter: off</button>
-      <button onclick="send({cmd:'eq_reset'})">Reset EQ</button>
-      <span class="pill" id="eqstate"></span>
+      <button id="webplay" onclick="webPlay()">Play in this browser</button>
+      <button id="webmode" onclick="webToggle()">Route to web: off</button>
+      <span class="pill" id="webstat">idle</span>
     </div>
+    <div class="row">
+      <div id="meter"><i></i></div>
+      <span class="pill" id="webinfo"></span>
+    </div>
+    <p class="empty">Sends the mixed audio to this tab instead of a speaker or headset.
+       Playback starts on click because browsers require a gesture. Keep this tab open and
+       unmuted &mdash; latency is about <span id="latms">200</span> ms.</p>
   </section>
 
   <section id="cardssec" style="display:none">
@@ -137,8 +168,10 @@ function toast(m){
 // ---- connections ----------------------------------------------------------
 function connect(){
   ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.binaryType = 'arraybuffer';
   ws.onopen = () => setInterval(() => { if(ws.readyState !== 1) connect(); }, 4000);
   ws.onmessage = e => {
+    if (typeof e.data !== 'string'){ onAudio(e.data); return; }
     const m = JSON.parse(e.data);
     if (m.toast) return toast(m.toast);
     if (m.version !== undefined) render(m);
@@ -147,32 +180,418 @@ function connect(){
 let ws;
 connect();
 
-// ---- rendering ------------------------------------------------------------
-const EQ = [['Low','120 Hz'],['Mid','500 Hz'],['Upper','3 kHz'],['Air','8 kHz']];
-$('#eq').innerHTML = EQ.map((l,i) =>
-  `<div class="eqrow"><label>${l[0]} · ${l[1]}</label>
-   <input type="range" min="-12" max="12" step="0.5" value="0" id="eq${i}">
-   <span class="vol" id="eqv${i}">0</span></div>`).join('');
-[0,1,2,3].forEach(i => $('#eq'+i).addEventListener('input', e => {
-  $('#eqv'+i).textContent = (+e.target.value).toFixed(1);
-  send({cmd:'eq', band:i, gain:+e.target.value});
-}));
+// ---- web output -----------------------------------------------------------
+// The server pushes raw s16le stereo PCM as binary frames; an AudioWorklet
+// ring-buffered on the page side plays it, aiming to sit ~150 ms deep and only
+// discarding past 300 ms — the usual jitter/latency trade for a LAN stream.
+const WORKLET = `
+class PcmSink extends AudioWorkletProcessor {
+  constructor(){
+    super();
+    // Storage, the level we aim to sit at, and the point at which we would
+    // rather drop than fall further behind. Dropping is only for a genuine
+    // emergency: do it eagerly and every burst becomes an audible gap.
+    this.cap  = Math.ceil(sampleRate * 0.35);         // 350 ms of storage
+    this.target = Math.ceil(sampleRate * 0.12);       // ~120 ms, adapted at runtime
+    this.starve = 0;
+    this.max  = Math.ceil(sampleRate * 0.30);         // give up past 300 ms
+    this.L = new Float32Array(this.cap);
+    this.R = new Float32Array(this.cap);
+    this.w = 0; this.r = 0; this.n = 0;                 // write idx / read idx / frames held
+    this.primed = false; this.tick = 0;
+    this.port.onmessage = (e) => {
+      const s = new Int16Array(e.data), frames = s.length >> 1;
+      // A stalled tab must not grow the buffer without bound: drop the
+      // oldest audio and resync to whatever is live now.
+      const over = this.n + frames - this.cap;
+      if (over > 0){ this.w = (this.w + over) % this.cap; this.n -= over; }
+      for (let f = 0; f < frames; f++){
+        this.L[this.w] = s[2*f] / 32768;
+        this.R[this.w] = s[2*f+1] / 32768;
+        this.w = (this.w + 1) % this.cap;
+      }
+      this.n += frames;
+    };
+  }
+  process(_in, outputs){
+    const out = outputs[0], L = out[0], R = out.length > 1 ? out[1] : out[0];
+    // Bound the depth: drop the oldest frames rather than play them late.
+    if (this.n > this.max){ const d = this.n - this.max; this.w = (this.w + d) % this.cap; this.n -= d; }
+    if (this.gain == null) this.gain = 1;
+    let r = (this.w - this.n + this.cap) % this.cap, peak = 0;
+    for (let i = 0; i < L.length; i++){
+      let l = 0, rr = 0;
+      if (this.n > 0){
+        l = this.L[r]; rr = this.R[r];
+        r = (r + 1) % this.cap; this.n--;
+        if (this.gain < 1) this.gain = Math.min(1, this.gain + 1 / 144);
+      } else if (this.gain > 0) {
+        this.gain = Math.max(0, this.gain - 1 / 144);
+      }
+      if (this.gain < 1){ l *= this.gain; rr *= this.gain; }
+      L[i] = l; R[i] = rr;
+      const a = Math.abs(l) > Math.abs(rr) ? Math.abs(l) : Math.abs(rr);
+      if (a > peak) peak = a;
+    }
+    if (!this.n && this.primed){
+      this.starve++;
+      if (this.starve > 1 && this.target < sampleRate * 0.30)
+        this.target += Math.ceil(sampleRate * 0.05);
+    } else if (this.primed && --this.starve < -8 && this.target > sampleRate * 0.08){
+      this.target -= Math.ceil(sampleRate * 0.01);
+    }
+    // The drop threshold must always stay above the target, or we would sit
+    // permanently above it and throw away audio forever.
+    if (this.max < this.target * 1.35) this.max = Math.ceil(this.target * 1.35);
+    if (this.cap <= this.max) this.cap = Math.ceil(this.max * 1.25);
+    if (this.L.length < this.cap){
+      this.L = new Float32Array(this.cap); this.R = new Float32Array(this.cap);
+      this.w = 0; this.r = 0; this.n = 0;
+    }
+    if (!this.primed && this.n >= this.target){
+      this.primed = true;
+      this.port.postMessage({ primed: true });
+    }
+    // Report the level a few times a second, not every few milliseconds:
+    // each of these crosses to the main thread and touches the DOM, and a
+    // busy main thread delays the very messages that feed this ring.
+    if (++this.tick % 64 === 0)
+      this.port.postMessage({ peak: peak, depth: this.n / sampleRate * 1000,
+                             target: this.target / sampleRate * 1000 });
+    return true;                                       // never starve
+  }
+}
+registerProcessor('pcm-sink', PcmSink);
+`;
 
+let actx = null, node = null, primed = false, ring = null, bufMs = 0;
+let underruns = 0, droppedMs = 0, starve = 0, targetMs = () => 0;
+
+// Shared ring buffer, so the fallback path behaves exactly like the worklet.
+function Ring(cap, maxFrames){
+  this.L = new Float32Array(cap); this.R = new Float32Array(cap);
+  this.cap = cap; this.max = maxFrames; this.w = 0; this.r = 0; this.n = 0;
+}
+// Throw away the oldest frames. For live audio, dropping is always better than
+// playing late: it costs a glitch instead of latency that keeps growing.
+Ring.prototype.skip = function(k){ this.r = (this.r + k) % this.cap; this.n -= k; };
+Ring.prototype.push = function(s16){
+  const frames = s16.length >> 1;
+  // A stalled tab must not grow the buffer forever: drop the oldest audio.
+  const over = this.n + frames - this.cap;
+  if (over > 0){ this.r = (this.r + over) % this.cap; this.n -= over; }
+  let peak = 0;
+  for (let f = 0; f < frames; f++){
+    const l = s16[2*f] / 32768, r = s16[2*f+1] / 32768;
+    this.L[this.w] = l; this.R[this.w] = r;
+    this.w = (this.w + 1) % this.cap;
+    const a = Math.abs(l) > Math.abs(r) ? Math.abs(l) : Math.abs(r);
+    if (a > peak) peak = a;
+  }
+  this.n += frames;
+  return peak;
+};
+// ~3 ms ramp at 48 kHz. Jumping straight to zero when the buffer runs dry is
+// what makes an underrun sound like a click; easing across it removes the
+// click, which is the part that actually reaches the listener.
+const RAMP = 1 / 144;
+Ring.prototype.read = function(oL, oR){
+  if (this.max && this.n > this.max) this.drop = (this.drop || 0) + (this.n - this.max);
+  if (this.max && this.n > this.max) this.skip(this.n - this.max);
+  if (this.gain == null) this.gain = 1;
+  let peak = 0;
+  for (let i = 0; i < oL.length; i++){
+    let l = 0, rr = 0;
+    if (this.n > 0){
+      l = this.L[this.r]; rr = this.R[this.r];
+      this.r = (this.r + 1) % this.cap; this.n--;
+      if (this.gain < 1){ this.gain = Math.min(1, this.gain + RAMP); }
+    } else {
+      if (this.gain > 0){ this.gain = Math.max(0, this.gain - RAMP); }
+      if (i === 0) this.under = (this.under || 0) + 1;
+    }
+    if (this.gain < 1){ l *= this.gain; rr *= this.gain; }
+    oL[i] = l; if (oR) oR[i] = rr;
+    const a = Math.abs(l) > Math.abs(rr) ? Math.abs(l) : Math.abs(rr);
+    if (a > peak) peak = a;
+  }
+  return peak;
+};
+
+async function webPlay(){
+  if (actx){ return webStop(); }
+  try{
+    // Pin the rate to match the PCM the server sends. If the device opens at
+    // 44.1 kHz the whole stream plays ~9% fast, which sounds wrong in a way
+    // that is easy to mistake for distortion. 'interactive' keeps the output
+    // buffer small; 'playback' would trade latency for throughput.
+    const SR = 48000;
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    actx = new Ctor({ latencyHint: 'interactive', sampleRate: SR });
+    if (actx.sampleRate !== SR){
+      toast('Audio rate is ' + actx.sampleRate + ' Hz, expected ' + SR + ' — audio may sound fast.');
+    }
+    node = await makeSink(actx);
+    node.connect(actx.destination);
+    await actx.resume();
+    primed = false;
+    // Routing the mix into the browser has to be switched on server side too.
+    if (!(S && S.web)) send({ cmd: 'web', on: true });
+    renderWeb();
+  }catch(err){
+    toast('Web output failed: ' + err.message);
+    webCleanup();
+    renderWeb();
+  }
+}
+
+// AudioWorklet is only exposed in a secure context, and this page is normally
+// reached over plain http on the LAN (http://pi:8420), where
+// ctx.audioWorklet is simply undefined. Fall back to ScriptProcessorNode there
+// — it is deprecated, but it works and behaves the same for our purposes.
+async function makeSink(ctx){
+  if (ctx.audioWorklet && ctx.audioWorklet.addModule){
+    try{
+      const url = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
+      await ctx.audioWorklet.addModule(url);
+      URL.revokeObjectURL(url);
+      const n = new AudioWorkletNode(ctx, 'pcm-sink', { outputChannelCount: [2] });
+      n.port.onmessage = e => {
+        if (e.data.primed){ primed = true; renderWeb(); }
+        else if (e.data.peak != null){
+          meter(e.data.peak);
+          if (e.data.depth != null) bufMs = e.data.depth;
+          if (e.data.target != null) targetMs = () => e.data.target;
+        }
+      };
+      return n;
+    }catch(err){
+      console.warn('AudioWorklet unavailable, falling back to ScriptProcessor:', err);
+    }
+  }
+  return scriptSink(ctx);
+}
+
+function scriptSink(ctx){
+  // Start at 60 ms for low latency; the adaptive logic grows it only if the
+  // tab actually starves, and shrinks it again quickly when it does not.
+  ring = new Ring(Math.ceil(ctx.sampleRate * 0.35), Math.ceil(ctx.sampleRate * 0.16));
+  let target = Math.ceil(ctx.sampleRate * 0.12);
+  underruns = 0; starve = 0;
+  let tick = 0;
+  const sp = ctx.createScriptProcessor(1024, 0, 2);
+  sp.onaudioprocess = e => {
+    const out = e.outputBuffer;
+    const peak = ring.read(out.getChannelData(0), out.getChannelData(1));
+    if (!primed && ring.n >= target){ primed = true; renderWeb(); }
+
+    // Adaptive: if we keep running dry, this tab or network cannot sustain the
+    // current depth, so ask for more. Recover slowly once it is stable again.
+    if (ring.under){
+      starve++;
+      if (starve > 1 && target < ctx.sampleRate * 0.30){
+        target += Math.ceil(ctx.sampleRate * 0.05);
+      }
+    } else if (--starve < -8 && target > ctx.sampleRate * 0.08){
+      target -= Math.ceil(ctx.sampleRate * 0.01);   // ease back down
+    }
+    ring.target = target;
+    // Keep the drop threshold above the target, and the storage above that.
+    if (ring.max < target * 1.35){
+      ring.max = Math.ceil(target * 1.35);
+      if (ring.L.length < ring.max * 1.25){
+        const old = ring;
+        ring = new Ring(Math.ceil(ring.max * 1.3), ring.max);
+        ring.under = old.under; ring.drop = old.drop; ring.gain = old.gain;
+        ring.target = target;
+      }
+    }
+    if (++tick % 4 === 0){
+      meter(peak);
+      bufMs = ring.n / ctx.sampleRate * 1000;
+      underruns = ring.under || 0;
+      droppedMs = (ring.drop || 0) / ctx.sampleRate * 1000;
+      targetMs = () => ring.target / ctx.sampleRate * 1000;
+    }
+  };
+  sp.port = { postMessage: buf => { ring.push(new Int16Array(buf)); } };
+  return sp;
+}
+
+function webStop(){
+  send({ cmd: 'web', on: false });
+  webCleanup();
+  renderWeb();
+}
+
+function webCleanup(){
+  if (node){
+    // The ScriptProcessor fallback uses a plain object for `port`, and needs
+    // its callback cleared too or it keeps pulling from a dead ring.
+    node.onaudioprocess = null;
+    node.port.onmessage = null;
+    node.disconnect();
+    node = null;
+  }
+  ring = null;
+  if (actx){ try{ if (actx.close) actx.close(); }catch(e){} actx = null; }
+  primed = false;
+  meter(0);
+}
+
+const webToggle = () => { const on = !(S && S.web); send({cmd:'web', on}); };
+
+function onAudio(buf){
+  // Always feed the worklet while it exists: it decides when it has enough
+  // buffered to start, and gating on that flag here would deadlock.
+  if (node) node.port.postMessage(buf, [buf]);
+}
+
+let meterT;
+function meter(v){
+  const db = v > 0.00001 ? 20*Math.log10(v) : -60;
+  const pctv = Math.max(0, Math.min(100, (db + 60) / 60 * 100));
+  $('#meter i').style.width = pctv + '%';
+  $('#meter i').style.background = db > -1 ? 'var(--bad)' : 'var(--accent)';
+  $('#webinfo').textContent = db <= -59.9 ? 'silent' : Math.round(db) + ' dBFS';
+  clearTimeout(meterT);
+  meterT = setTimeout(() => $('#webinfo').textContent = '', 1200);
+}
+
+function renderWeb(){
+  const routing = !!(S && S.web);
+  $('#webmode').textContent = 'Route to web: ' + (routing ? 'on' : 'off');
+  $('#webmode').className = routing ? 'p' : '';
+  $('#webplay').textContent = actx ? 'Stop web output' : 'Play in this browser';
+  $('#webplay').className = actx ? '' : 'p';
+  let st = actx ? (primed ? 'playing' : 'buffering…') : 'idle';
+  if (actx && primed){
+    st += ' · ' + Math.round(bufMs) + ' ms buffered';
+    st += ' (target ' + Math.round(targetMs()) + ')';
+    if (underruns) st += ' · ' + underruns + ' underruns';
+    if (droppedMs > 1) st += ' · ' + Math.round(droppedMs) + ' ms dropped';
+  }
+  $('#webstat').textContent = routing && !actx ? 'routing on — nothing playing' : st;
+}
+
+// ---- bluetooth test tone --------------------------------------------------
+// Deliberately CONTINUOUS. The earlier version gated, swept and chopped the
+// signal, which hid the very fault we are chasing: a steady tone is the only
+// way to see chunking and drift. Two long segments, left and right on
+// different frequencies so pitch and channel separation stay verifiable.
+const TONE_SEGMENTS = [
+  { name: 'continuous 440 / 660 Hz', dur: 15, kind: 'a' },
+  { name: 'continuous 1000 / 1500 Hz', dur: 15, kind: 'b' },
+];
+
+let toneCtx = null, toneAbort = 0, toneTick = 0;
+
+async function playTone(){
+  if (toneCtx) return stopTone();
+  const st = $('#tonestat');
+  st.textContent = 'starting…';
+  try{
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) throw new Error('this browser has no Web Audio support');
+    try{ toneCtx = new Ctor({ sampleRate: 48000 }); }
+    catch(e){ toneCtx = new Ctor(); }
+    await toneCtx.resume();
+    if (toneCtx.state !== 'running')
+      throw new Error('audio context is ' + toneCtx.state + ' - the browser blocked playback, tap again');
+    $('#tonebtn').textContent = 'Stop test tone';
+    $('#tonebtn').className = '';
+    st.style.color = '';
+
+    let at = toneCtx.currentTime + 0.1;
+    for (const seg of TONE_SEGMENTS){
+      // One short beep to mark the boundary, then a long unbroken tone.
+      toneBeep(at);
+      at += 0.16;
+      toneContinuous(at, seg);
+      at += seg.dur;
+    }
+    const total = at - toneCtx.currentTime;
+    toneTick = setInterval(() => {
+      const el = toneCtx.currentTime - (at - total);
+      $('#tonestat').textContent = el >= total ? 'finished'
+        : 'playing ' + el.toFixed(1) + 's / ' + total.toFixed(0) + 's';
+    }, 200);
+    toneAbort = setTimeout(stopTone, (total + 1) * 1000);
+  }catch(err){
+    st.textContent = 'FAILED: ' + (err && err.message ? err.message : err);
+    st.style.color = 'var(--bad)';
+    toast('Test tone failed: ' + (err && err.message ? err.message : err));
+    stopTone(true);
+  }
+}
+
+function toneBeep(at){
+  const ctx = toneCtx;
+  const o = ctx.createOscillator(), g = ctx.createGain();
+  o.frequency.value = 2000;
+  g.gain.setValueAtTime(0.0001, at);
+  g.gain.linearRampToValueAtTime(0.5, at + 0.01);
+  g.gain.setValueAtTime(0.5, at + 0.09);
+  g.gain.linearRampToValueAtTime(0.0001, at + 0.11);
+  o.connect(g); g.connect(ctx.destination);
+  o.start(at); o.stop(at + 0.13);
+}
+
+// One unmodulated oscillator per channel for the whole segment. No gating, no
+// sweeps, nothing that could be mistaken for a dropout.
+function toneContinuous(at, seg){
+  const ctx = toneCtx;
+  const fL = seg.kind === 'a' ? 440 : 1000;
+  const fR = seg.kind === 'a' ? 660 : 1500;
+  const oL = ctx.createOscillator(), oR = ctx.createOscillator();
+  oL.frequency.value = fL; oR.frequency.value = fR;
+  const merge = ctx.createChannelMerger(2);
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, at);
+  g.gain.linearRampToValueAtTime(0.45, at + 0.02);   // short ramp, avoids a click
+  g.gain.setValueAtTime(0.45, at + seg.dur - 0.02);
+  g.gain.linearRampToValueAtTime(0.0001, at + seg.dur);
+  oL.connect(merge, 0, 0); oR.connect(merge, 0, 1);
+  merge.connect(g); g.connect(ctx.destination);
+  oL.start(at); oR.start(at);
+  oL.stop(at + seg.dur + 0.02); oR.stop(at + seg.dur + 0.02);
+}
+
+function stopTone(keepMessage){
+  clearInterval(toneTick);
+  clearTimeout(toneAbort);
+  if (toneCtx){ try{ if (toneCtx.close) toneCtx.close(); }catch(e){} toneCtx = null; }
+  const st = $('#tonestat');
+  if (!keepMessage){ st.textContent = 'idle'; st.style.color = ''; }
+  $('#tonebtn').textContent = 'Play test tone on this device';
+  $('#tonebtn').className = 'p';
+}
+
+// ---- rendering ------------------------------------------------------------
 let dragging = false;
 addEventListener('pointerdown', () => dragging = true);
 addEventListener('pointerup', () => setTimeout(() => dragging = false, 1200));
 
+// Rewriting innerHTML is a long main-thread task, and ScriptProcessorNode runs
+// on the main thread — so avoid the work when nothing has changed.
+const htmlCache = {};
+function setHTML(sel, html, key){
+  if (htmlCache[key] === html) return;
+  htmlCache[key] = html;
+  $(sel).innerHTML = html;
+}
+
 function render(s){
   S = s;
   $('#live').className = 'dot ' + (s.ok ? 'ok' : 'bad');
-  $('#ver').textContent = s.ok ? (s.version || '') : (s.error || 'pipewire unavailable');
-  $('#note').textContent = s.note || '';
+  $('#ver').textContent = (s.ok ? (s.version || '') : (s.error || 'pipewire unavailable'))
+                     + (s.build ? '  ·  built ' + s.build : '');
   $('#scanbtn').textContent = s.scanning ? 'Scanning…' : 'Scan';
   $('#scanbtn').disabled = !!s.scanning;
 
   // inputs
   const ins = s.inputs || [];
-  $('#inputs').innerHTML = ins.length ? ins.map(n => `
+  setHTML('#inputs', ins.length ? ins.map(n => `
     <div class="row">
       <span class="name" title="${esc(n.name)}">${esc(n.name)}</span>
       ${n.bluetooth ? '<span class="tag bt">A2DP</span>' : ''}
@@ -181,32 +600,36 @@ function render(s){
       <span class="vol">${pct(n.vol)}</span>
       <button class="mute ${n.muted ? 'on' : ''}" onclick="mute(${n.id},${!n.muted})">M</button>
       <button class="solo ${n.solo ? 'on' : ''}" onclick="send({cmd:'solo',id:${n.id},on:${!n.solo}})">S</button>
-    </div>`).join('') : '<div class="empty">No inputs yet. Connect a Bluetooth phone or a USB/line-in device.</div>';
+    </div>`).join('') : '<div class="empty">No inputs yet. Connect a Bluetooth phone or a USB/line-in device.</div>', 'inputs');
 
   // outputs
-  const outs = s.outputs || [];
-  $('#outputs').innerHTML = outs.length ? outs.map(n => `
+  const outs = (s.outputs || []).map(n => ({
+    ...n, label: n.name === 'WebOutput' ? 'This browser (web output)' : n.name
+  }));
+  setHTML('#outputs', outs.length ? outs.map(n => `
     <div class="row">
       <input type="radio" name="out" ${n.id === s.selected ? 'checked' : ''}
              onchange="send({cmd:'output',id:${n.id}})">
-      <span class="name" title="${esc(n.name)}">${esc(n.name)}</span>
+      <span class="name" title="${esc(n.label)}">${esc(n.label)}</span>
       ${n.bluetooth ? '<span class="tag bt">A2DP</span>' : ''}
       ${n.default ? '<span class="tag on">system default</span>' : ''}
       <span class="vol">${pct(n.vol)}</span>
-    </div>`).join('') : '<div class="empty">No output sink available.</div>';
+    </div>`).join('') : '<div class="empty">No output sink available.</div>', 'outputs');
   if (!dragging) { $('#master').value = Math.round((s.master ?? 1) * 100); $('#masterv').textContent = pct(s.master); }
+  if (!dragging) { $('#gain').value = Math.round((s.gain ?? 1) * 100); $('#gainv').textContent = pct(s.gain); }
 
-  // eq
-  if (!dragging) (s.eq || [0,0,0,0]).forEach((g,i) => {
-    const e = $('#eq'+i); if (e && document.activeElement !== e){ e.value = g; $('#eqv'+i).textContent = (+g).toFixed(1); }
-  });
-  $('#lim').textContent = 'Limiter: ' + (s.limiter ? 'on' : 'off');
-  $('#lim').className = s.limiter ? 'p' : '';
-  $('#eqstate').textContent = s.filter_live ? 'filter active' : 'filter not running';
-
+  renderWeb();
+  renderCodec(s.bt_codec);
   renderBt(s.bluetooth);
   renderNet(s.net);
   renderCards(s.cards);
+}
+
+function renderCodec(codec){
+  const row = document.querySelector('#codecrow');
+  if (!codec){ row.style.display = 'none'; return; }
+  row.style.display = '';
+  document.querySelector('#codec').textContent = codec.replace(/_/g, ' ').toUpperCase();
 }
 
 function renderBt(bt){
@@ -217,19 +640,25 @@ function renderBt(bt){
     : (a.name || 'adapter') + ' · ' + (a.mac || 'no controller') + ' · ' + (a.powered ? 'powered' : 'off');
   if (!bt || bt.error) return;
   const ds = Array.isArray(bt.devices) ? bt.devices : [];
-  $('#bt').innerHTML = ds.length ? ds.map(d => `
+  setHTML('#bt', ds.length ? ds.map(d => `
     <div class="row">
       <span class="name" title="${esc(d.addr)}">${esc(d.name)}</span>
       <span class="tag">${esc(d.role || '—')}</span>
       ${d.connected ? '<span class="tag on">connected</span>' : ''}
       ${d.paired ? '<span class="tag">paired</span>' : ''}
+      ${d.trusted ? '' : '<span class="tag">not trusted</span>'}
       ${d.connected
         ? `<button onclick="btAct('disconnect','${d.addr}')">Disconnect</button>`
-        : (d.paired ? `<button class="p" onclick="btAct('connect','${d.addr}')">Connect</button>`
-                    : `<button onclick="btAct('trust','${d.addr}')">Trust</button>
-                       <button class="p" onclick="btAct('pair','${d.addr}')">Pair</button>`)}
+        : (d.paired
+            ? (d.trusted
+                ? `<button class="p" onclick="btAct('connect','${d.addr}')">Connect</button>`
+                : `<button class="p" onclick="btAct('trust','${d.addr}')">Trust</button>
+                   <button onclick="btAct('connect','${d.addr}')">Connect</button>`)
+            : `<button onclick="btAct('trust','${d.addr}')">Trust</button>
+               <button class="p" onclick="btAct('pair','${d.addr}')">Pair</button>`)}
+      <button class="danger" title="Forget this device" onclick="btRemove('${d.addr}','${esc(d.name)}')">✕</button>
     </div>`).join('')
-    : `<div class="empty">${a.powered ? 'No devices known yet.' : 'Bluetooth adapter is powered off.'}</div>`;
+    : `<div class="empty">${a.powered ? 'No devices known yet.' : 'Bluetooth adapter is powered off.'}</div>`, 'bt');
 }
 
 function renderNet(n){
@@ -259,11 +688,22 @@ function vol(id, el){
   clearTimeout(volT[id]); volT[id] = setTimeout(() => send({cmd:'vol', id, vol:v}), 120);
 }
 const mute = (id,on) => send({cmd:'mute', id, on});
-const btAct = (action,addr) => send({cmd:'bt_action', action, addr});
+const btAct = (action,addr) => {
+  if (action === 'pair') toast('Pairing — check your phone for a pairing request and accept it.');
+  send({cmd:'bt_action', action, addr});
+};
+const btRemove = (addr,name) => {
+  // Removing forgets the link key, so the device has to go through pairing
+  // again. Worth a confirmation.
+  if (confirm('Remove ' + name + '?\n\nThis forgets the pairing key on both sides. '
+            + 'You will need to pair the device again before it can send audio.')) {
+    send({cmd:'bt_action', action:'remove', addr});
+  }
+};
 const scan  = () => send({cmd:'bt_scan'});
 const power = () => send({cmd:'bt_power', on: !(S && S.bluetooth && S.bluetooth.adapter && S.bluetooth.adapter.powered)});
 const setMaster = v => { $('#masterv').textContent = v + '%'; send({cmd:'master', vol: v/100}); };
-const toggleLim = () => S && send({cmd:'limiter', on: !S.limiter});
+const setGain = v => { $('#gainv').textContent = v + '%'; send({cmd:'gain', vol: v/100}); };
 function addNet(){
   const el = $('#netname');
   send({cmd:'net_add', name: el.value.trim() || 'net', session: (S && (S.net||[]).length || 0) + 1});

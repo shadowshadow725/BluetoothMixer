@@ -1,0 +1,4 @@
+[build]
+# Leave a core for the audio stack: this box is a mixer, and a saturated Pi
+# shows up as dropouts long before it shows up as a slow build.
+jobs = 3

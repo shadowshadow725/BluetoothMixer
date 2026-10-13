@@ -8,6 +8,7 @@ use axum::routing::{any, get};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::state::App;
@@ -36,14 +37,33 @@ async fn socket(State(app): State<Arc<App>>, ws: WebSocketUpgrade) -> Response {
 
 async fn session(app: Arc<App>, socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
-    let (tx, mut rx) = unbounded_channel::<String>();
+    let (tx, mut rx) = unbounded_channel::<Message>();
     app.add_client(tx.clone());
     let _ = sink.send(Message::Text(app.last_state().to_string())).await;
 
+    // One pump owns the write half, interleaving JSON state pushes with the
+    // captured PCM frames so neither starves the other.
+    let mut audio = app.subscribe_audio();
+    let dropped = app.audio_dropped.clone();
     let pump = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if sink.send(Message::Text(msg)).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(m) => { if sink.send(m).await.is_err() { break } }
+                    None => break,
+                },
+                frame = audio.recv() => match frame {
+                    Ok(bytes) => {
+                        if sink.send(Message::Binary(bytes.into())).await.is_err() { break }
+                    }
+                    // The socket stalled long enough for frames to fall out of
+                    // the queue. Those are real chunks of audio, so count them
+                    // rather than pretending the stream is intact.
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        dropped.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
             }
         }
     });
@@ -64,7 +84,9 @@ async fn session(app: Arc<App>, socket: WebSocket) {
             Err(e) => Some(format!("error: bad request ({e})")),
         };
         if let Some(r) = reply {
-            let _ = tx.send(serde_json::json!({ "toast": r }).to_string());
+            let _ = tx.send(Message::Text(
+                serde_json::json!({ "toast": r }).to_string(),
+            ));
         }
     }
 
