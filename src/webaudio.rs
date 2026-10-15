@@ -13,7 +13,7 @@
 use anyhow::{anyhow, Result};
 use pipewire as pw;
 use pw::spa;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,16 +25,19 @@ pub const NODE_NAME: &str = "btmixer-web-capture";
 pub const RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
 
-/// If the socket cannot keep up for this long we stop dropping audio and
-/// back off: fill the gap with silence rather than clipping. TCP has already
-/// retransmitted by this point, so the data is coming, just late — and late
-/// audio is worse than a short gap.
-
 /// One WebSocket binary frame. 20 ms is 1920 frames, so the browser gets 50
 /// messages a second rather than 100. Every message is a main-thread task on
 /// the `ScriptProcessorNode` path, and halving the event rate measurably
 /// reduces the stalls that starve it. Going finer costs more than it buys.
 pub const CHUNK_MS: usize = 20;
+
+/// How much audio [`pump_loop`] will hold back while catching up on its clock,
+/// in frames. The server delivers at exactly the rate the browser consumes, so
+/// a backlog never drains itself: releasing it late does not buy back the lost
+/// time, it just parks that much extra latency in the browser's ring for the
+/// rest of the session. Past this limit the excess is discarded instead and
+/// counted in the state document.
+pub const MAX_BACKLOG_CHUNKS: usize = 5;
 
 pub const SINK_NAME: &str = "btmixer_web";
 /// `pactl load-module` splits its arguments on whitespace and has no quoting,
@@ -82,8 +85,12 @@ pub async fn drop_sink(id: u32) {
 }
 
 /// Attach a native libpipewire capture to the null sink's monitor ports and
-/// pump it into `tx` as fixed-size frames.
-pub fn spawn_capture(tx: tokio::sync::broadcast::Sender<Vec<u8>>) -> Capture {
+/// pump it into `tx` as fixed-size frames. Frames discarded to stay on the
+/// clock are added to `dropped`.
+pub fn spawn_capture(
+    tx: tokio::sync::broadcast::Sender<Vec<u8>>,
+    dropped: Arc<AtomicU64>,
+) -> Capture {
     let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -103,7 +110,7 @@ pub fn spawn_capture(tx: tokio::sync::broadcast::Sender<Vec<u8>>) -> Capture {
     }
 
     let pump = tokio::spawn(async move {
-        if let Err(e) = pump_loop(raw_rx, tx).await {
+        if let Err(e) = pump_loop(raw_rx, tx, dropped).await {
             eprintln!("web output: capture stopped: {e}");
         }
     });
@@ -271,14 +278,28 @@ fn capture_thread_inner(
 async fn pump_loop(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     tx: tokio::sync::broadcast::Sender<Vec<u8>>,
+    dropped: Arc<AtomicU64>,
 ) -> Result<()> {
     let size = chunk_bytes();
     let slot = Duration::from_millis(CHUNK_MS as u64);
+    let cap = size * MAX_BACKLOG_CHUNKS;
     let mut carry: Vec<u8> = Vec::new();
     let mut next_due = tokio::time::Instant::now();
 
     while let Some(mut data) = rx.recv().await {
         carry.append(&mut data);
+        // If we are running behind, the oldest audio has already missed its
+        // slot: TCP has retransmitted by now, so it is coming, just late, and
+        // late audio is worse than a short gap. Discarding keeps the stream on
+        // the clock, where handing it over would leave the browser playing a
+        // backlog it has no way to work off. Whole frames only — a partial
+        // discard would skew every following frame's L/R pairing.
+        if carry.len() > cap {
+            let over = carry.len() - cap;
+            let whole = over.div_ceil(size);
+            carry.drain(..whole * size);
+            dropped.fetch_add(whole as u64, Ordering::Relaxed);
+        }
         while carry.len() >= size {
             // Hold every chunk to a fixed 20 ms slot on the wall clock, and
             // re-anchor whenever we have fallen behind.

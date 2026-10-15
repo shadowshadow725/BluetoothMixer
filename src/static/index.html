@@ -139,7 +139,7 @@ select,input[type=text]{background:var(--panel2);color:var(--fg);border:1px soli
     </div>
     <p class="empty">Sends the mixed audio to this tab instead of a speaker or headset.
        Playback starts on click because browsers require a gesture. Keep this tab open and
-       unmuted &mdash; latency is about <span id="latms">200</span> ms.</p>
+       unmuted &mdash; latency is about <span id="latms">120</span> ms.</p>
   </section>
 
   <section id="cardssec" style="display:none">
@@ -182,19 +182,24 @@ connect();
 
 // ---- web output -----------------------------------------------------------
 // The server pushes raw s16le stereo PCM as binary frames; an AudioWorklet
-// ring-buffered on the page side plays it, aiming to sit ~150 ms deep and only
-// discarding past 300 ms — the usual jitter/latency trade for a LAN stream.
+// ring-buffered on the page side plays it, holding itself ~120 ms deep (adapted
+// at runtime) and discarding whatever sits above that — the usual jitter/latency
+// trade for a LAN stream.
 const WORKLET = `
 class PcmSink extends AudioWorkletProcessor {
   constructor(){
     super();
-    // Storage, the level we aim to sit at, and the point at which we would
-    // rather drop than fall further behind. Dropping is only for a genuine
-    // emergency: do it eagerly and every burst becomes an audible gap.
-    this.cap  = Math.ceil(sampleRate * 0.35);         // 350 ms of storage
+    // Storage, the level we aim to sit at, and the slack allowed above it.
+    // The slack has to exceed one 20 ms server frame, because that is the
+    // granularity audio arrives in: any tighter and the steady-state ripple
+    // trips the discard on every single frame. Storage is sized for the worst
+    // case — the adaptive step overshoots its own 300 ms ceiling by up to
+    // 50 ms, and a frame can still land after that.
+    this.cap  = Math.ceil(sampleRate * 0.45);         // 450 ms of storage
     this.target = Math.ceil(sampleRate * 0.12);       // ~120 ms, adapted at runtime
+    this.band = Math.ceil(sampleRate * 0.04);         // 40 ms of slack above it
     this.starve = 0;
-    this.max  = Math.ceil(sampleRate * 0.30);         // give up past 300 ms
+    this.drop = 0;
     this.L = new Float32Array(this.cap);
     this.R = new Float32Array(this.cap);
     this.w = 0; this.r = 0; this.n = 0;                 // write idx / read idx / frames held
@@ -203,8 +208,7 @@ class PcmSink extends AudioWorkletProcessor {
       const s = new Int16Array(e.data), frames = s.length >> 1;
       // A stalled tab must not grow the buffer without bound: drop the
       // oldest audio and resync to whatever is live now.
-      const over = this.n + frames - this.cap;
-      if (over > 0){ this.w = (this.w + over) % this.cap; this.n -= over; }
+      this.skip(this.n + frames - this.cap);
       for (let f = 0; f < frames; f++){
         this.L[this.w] = s[2*f] / 32768;
         this.R[this.w] = s[2*f+1] / 32768;
@@ -213,17 +217,23 @@ class PcmSink extends AudioWorkletProcessor {
       this.n += frames;
     };
   }
+  // Throw away the oldest frames. For live audio, dropping is always better
+  // than playing late: it costs a glitch instead of latency that keeps growing.
+  skip(k){ if (k <= 0) return; this.drop += k; this.r = (this.r + k) % this.cap; this.n -= k; }
   process(_in, outputs){
     const out = outputs[0], L = out[0], R = out.length > 1 ? out[1] : out[0];
-    // Bound the depth: drop the oldest frames rather than play them late.
-    if (this.n > this.max){ const d = this.n - this.max; this.w = (this.w + d) % this.cap; this.n -= d; }
+    // Hold the depth at the target. Nothing else pulls it back down: the
+    // server delivers at exactly the rate we consume, so without this the
+    // level set by the first few seconds of jitter is the level we sit at
+    // for the rest of the session.
+    this.skip(this.n - (this.target + this.band));
     if (this.gain == null) this.gain = 1;
-    let r = (this.w - this.n + this.cap) % this.cap, peak = 0;
+    let peak = 0;
     for (let i = 0; i < L.length; i++){
       let l = 0, rr = 0;
       if (this.n > 0){
-        l = this.L[r]; rr = this.R[r];
-        r = (r + 1) % this.cap; this.n--;
+        l = this.L[this.r]; rr = this.R[this.r];
+        this.r = (this.r + 1) % this.cap; this.n--;
         if (this.gain < 1) this.gain = Math.min(1, this.gain + 1 / 144);
       } else if (this.gain > 0) {
         this.gain = Math.max(0, this.gain - 1 / 144);
@@ -240,14 +250,6 @@ class PcmSink extends AudioWorkletProcessor {
     } else if (this.primed && --this.starve < -8 && this.target > sampleRate * 0.08){
       this.target -= Math.ceil(sampleRate * 0.01);
     }
-    // The drop threshold must always stay above the target, or we would sit
-    // permanently above it and throw away audio forever.
-    if (this.max < this.target * 1.35) this.max = Math.ceil(this.target * 1.35);
-    if (this.cap <= this.max) this.cap = Math.ceil(this.max * 1.25);
-    if (this.L.length < this.cap){
-      this.L = new Float32Array(this.cap); this.R = new Float32Array(this.cap);
-      this.w = 0; this.r = 0; this.n = 0;
-    }
     if (!this.primed && this.n >= this.target){
       this.primed = true;
       this.port.postMessage({ primed: true });
@@ -257,7 +259,8 @@ class PcmSink extends AudioWorkletProcessor {
     // busy main thread delays the very messages that feed this ring.
     if (++this.tick % 64 === 0)
       this.port.postMessage({ peak: peak, depth: this.n / sampleRate * 1000,
-                             target: this.target / sampleRate * 1000 });
+                             target: this.target / sampleRate * 1000,
+                             drop: this.drop / sampleRate * 1000 });
     return true;                                       // never starve
   }
 }
@@ -268,18 +271,21 @@ let actx = null, node = null, primed = false, ring = null, bufMs = 0;
 let underruns = 0, droppedMs = 0, starve = 0, targetMs = () => 0;
 
 // Shared ring buffer, so the fallback path behaves exactly like the worklet.
-function Ring(cap, maxFrames){
+function Ring(cap, band){
   this.L = new Float32Array(cap); this.R = new Float32Array(cap);
-  this.cap = cap; this.max = maxFrames; this.w = 0; this.r = 0; this.n = 0;
+  this.cap = cap; this.band = band; this.w = 0; this.r = 0; this.n = 0;
 }
 // Throw away the oldest frames. For live audio, dropping is always better than
 // playing late: it costs a glitch instead of latency that keeps growing.
-Ring.prototype.skip = function(k){ this.r = (this.r + k) % this.cap; this.n -= k; };
+Ring.prototype.skip = function(k){
+  if (k <= 0) return;
+  this.drop = (this.drop || 0) + k;
+  this.r = (this.r + k) % this.cap; this.n -= k;
+};
 Ring.prototype.push = function(s16){
   const frames = s16.length >> 1;
   // A stalled tab must not grow the buffer forever: drop the oldest audio.
-  const over = this.n + frames - this.cap;
-  if (over > 0){ this.r = (this.r + over) % this.cap; this.n -= over; }
+  this.skip(this.n + frames - this.cap);
   let peak = 0;
   for (let f = 0; f < frames; f++){
     const l = s16[2*f] / 32768, r = s16[2*f+1] / 32768;
@@ -296,8 +302,8 @@ Ring.prototype.push = function(s16){
 // click, which is the part that actually reaches the listener.
 const RAMP = 1 / 144;
 Ring.prototype.read = function(oL, oR){
-  if (this.max && this.n > this.max) this.drop = (this.drop || 0) + (this.n - this.max);
-  if (this.max && this.n > this.max) this.skip(this.n - this.max);
+  // Hold the depth at the target, for the same reason the worklet does.
+  this.skip(this.n - (this.target + this.band));
   if (this.gain == null) this.gain = 1;
   let peak = 0;
   for (let i = 0; i < oL.length; i++){
@@ -335,6 +341,7 @@ async function webPlay(){
     node.connect(actx.destination);
     await actx.resume();
     primed = false;
+    droppedMs = 0; underruns = 0; bufMs = 0;
     // Routing the mix into the browser has to be switched on server side too.
     if (!(S && S.web)) send({ cmd: 'web', on: true });
     renderWeb();
@@ -362,6 +369,7 @@ async function makeSink(ctx){
           meter(e.data.peak);
           if (e.data.depth != null) bufMs = e.data.depth;
           if (e.data.target != null) targetMs = () => e.data.target;
+          if (e.data.drop != null) droppedMs = e.data.drop;
         }
       };
       return n;
@@ -373,15 +381,16 @@ async function makeSink(ctx){
 }
 
 function scriptSink(ctx){
-  // Start at 60 ms for low latency; the adaptive logic grows it only if the
-  // tab actually starves, and shrinks it again quickly when it does not.
-  ring = new Ring(Math.ceil(ctx.sampleRate * 0.35), Math.ceil(ctx.sampleRate * 0.16));
+  // Start at 120 ms for low latency; the adaptive logic grows it only if the
+  // tab actually starves, and shrinks it again when it does not.
+  ring = new Ring(Math.ceil(ctx.sampleRate * 0.45), Math.ceil(ctx.sampleRate * 0.04));
   let target = Math.ceil(ctx.sampleRate * 0.12);
   underruns = 0; starve = 0;
   let tick = 0;
   const sp = ctx.createScriptProcessor(1024, 0, 2);
   sp.onaudioprocess = e => {
     const out = e.outputBuffer;
+    ring.target = target;
     const peak = ring.read(out.getChannelData(0), out.getChannelData(1));
     if (!primed && ring.n >= target){ primed = true; renderWeb(); }
 
@@ -394,17 +403,6 @@ function scriptSink(ctx){
       }
     } else if (--starve < -8 && target > ctx.sampleRate * 0.08){
       target -= Math.ceil(ctx.sampleRate * 0.01);   // ease back down
-    }
-    ring.target = target;
-    // Keep the drop threshold above the target, and the storage above that.
-    if (ring.max < target * 1.35){
-      ring.max = Math.ceil(target * 1.35);
-      if (ring.L.length < ring.max * 1.25){
-        const old = ring;
-        ring = new Ring(Math.ceil(ring.max * 1.3), ring.max);
-        ring.under = old.under; ring.drop = old.drop; ring.gain = old.gain;
-        ring.target = target;
-      }
     }
     if (++tick % 4 === 0){
       meter(peak);

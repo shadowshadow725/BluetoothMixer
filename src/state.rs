@@ -267,7 +267,7 @@ impl App {
 
         let need_capture = self.capture.lock().unwrap().is_none();
         if need_capture {
-            let h = webaudio::spawn_capture(self.audio.clone());
+            let h = webaudio::spawn_capture(self.audio.clone(), self.audio_dropped.clone());
             *self.capture.lock().unwrap() = Some(h);
         }
         None
