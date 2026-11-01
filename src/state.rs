@@ -4,7 +4,7 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
@@ -37,6 +37,11 @@ pub struct Cfg {
     pub web: bool,
     /// Per-input mute intent, keyed by node description.
     pub mute: BTreeMap<String, bool>,
+    /// Per-input stereo placement, keyed by node description. `x` is the
+    /// horizontal component: -1 hard left, 0 centre, +1 hard right. `y` is
+    /// kept so the UI can show a source anywhere on its sound stage; only the
+    /// left/right axis can be rendered by a stereo mix.
+    pub pan: BTreeMap<String, Pan>,
     pub net: Vec<NetSource>,
 }
 
@@ -48,8 +53,48 @@ impl Default for Cfg {
             output: None,
             web: false,
             mute: BTreeMap::new(),
+            pan: BTreeMap::new(),
             net: vec![],
         }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+pub struct Pan {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Default for Pan {
+    fn default() -> Self {
+        // Straight ahead. A source that has never been placed sits at the
+        // front of the stage, which is also the neutral (centred) pan.
+        Self { x: 0.0, y: -1.0 }
+    }
+}
+
+impl Pan {
+    /// Clamp a UI-supplied position to the unit circle so a malformed command
+    /// cannot drive a channel past the level the fader promises.
+    fn normalized(mut self) -> Self {
+        if !self.x.is_finite() || !self.y.is_finite() {
+            return Self::default();
+        }
+        let len = (self.x * self.x + self.y * self.y).sqrt();
+        if len > 1.0 {
+            self.x /= len;
+            self.y /= len;
+        }
+        self
+    }
+
+    /// Channel gains relative to the fader level. At centre both sides are
+    /// unity; moving right attenuates only the left channel, so the source's
+    /// own stereo image is preserved (it is never downmixed to mono).
+    pub fn gains(self) -> (f32, f32) {
+        let x = self.x.clamp(-1.0, 1.0);
+        (1.0 - x.max(0.0), 1.0 + x.min(0.0))
     }
 }
 
@@ -77,6 +122,22 @@ pub struct App {
     web_sink: Mutex<Option<u32>>,
     /// Whether the stale-sink sweep has already run this process.
     web_clean: Mutex<bool>,
+    /// PulseAudio view of the graph, keyed by PipeWire node id. Needed to set
+    /// per-channel volumes for panning; refreshed when the input set changes.
+    pulse_map: Mutex<HashMap<u32, pw::PulseNode>>,
+    pulse_at: Mutex<Instant>,
+    /// Last input id set, so a phone connecting/disconnecting triggers a
+    /// refresh without polling `pactl` on every tick.
+    input_ids: Mutex<Vec<u32>>,
+    /// Gains we last wrote for each input. Keeps the poll loop from re-spawning
+    /// `pactl` every 900 ms while still reapplying after a reconnect or an
+    /// external volume change.
+    applied_gains: Mutex<HashMap<u32, (f32, f32, f32)>>,
+    /// Last time pan was reasserted on non-centred inputs.
+    pan_at: Mutex<Instant>,
+    /// Name and `wpctl` volume of every node from the last poll, so a fader or
+    /// pan drag does not need another `wpctl status` per pointer move.
+    node_cache: Mutex<HashMap<u32, (String, Option<f64>)>>,
     /// Negotiated A2DP codec for the running Bluetooth stream, cached because
     /// reading it means a `wpctl inspect` per lookup.
     bt_codec: Mutex<(String, Instant)>,
@@ -116,6 +177,12 @@ impl App {
             capture: Mutex::new(None),
             web_sink: Mutex::new(None),
             web_clean: Mutex::new(false),
+            pulse_map: Mutex::new(HashMap::new()),
+            pulse_at: Mutex::new(stale),
+            input_ids: Mutex::new(Vec::new()),
+            applied_gains: Mutex::new(HashMap::new()),
+            pan_at: Mutex::new(stale),
+            node_cache: Mutex::new(HashMap::new()),
             bt_codec: Mutex::new((String::new(), stale)),
             build: build_stamp(),
             last: Mutex::new(None),
@@ -246,7 +313,7 @@ impl App {
                 *g = true;
                 already
             };
-            if !swept {
+            if !swept && !webaudio::capture_active().await {
                 if let Some(id) = webaudio::sink_module().await {
                     webaudio::drop_sink(id).await;
                 }
@@ -433,6 +500,183 @@ impl App {
         }
     }
 
+    fn pan_of(&self, name: &str) -> Pan {
+        self.cfg
+            .lock()
+            .unwrap()
+            .pan
+            .get(name)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn cached_node(&self, id: u32) -> Option<(String, Option<f64>)> {
+        self.node_cache.lock().unwrap().get(&id).cloned()
+    }
+
+    /// Refresh the PulseAudio view of the graph. This is deliberately lazy:
+    /// the map only changes when inputs appear/disappear or renegotiate, so
+    /// the 900 ms poll should not pay for two `pactl list` calls every tick.
+    async fn refresh_pulse(&self, force: bool) -> HashMap<u32, pw::PulseNode> {
+        let stale = self.pulse_at.lock().unwrap().elapsed() > Duration::from_secs(5);
+        if force || stale {
+            match pw::pulse_nodes().await {
+                Ok(map) => *self.pulse_map.lock().unwrap() = map,
+                Err(e) => eprintln!("warning: cannot list pulse nodes: {e}"),
+            }
+            *self.pulse_at.lock().unwrap() = Instant::now();
+        }
+        self.pulse_map.lock().unwrap().clone()
+    }
+
+    /// Resolve the fader level for an input. `fresh` forces a new `pactl`
+    /// snapshot; intermediate drag commands reuse what the app last wrote so
+    /// a pointer move does not spawn a subprocess, while pointer-up pays for
+    /// an accurate read.
+    async fn base_volume(&self, id: u32, vol: Option<f64>, fresh: bool) -> f32 {
+        if let Some(v) = vol {
+            return pw::from_pw(v as f32);
+        }
+        if !fresh {
+            if let Some(&(_, _, base)) = self.applied_gains.lock().unwrap().get(&id) {
+                return base;
+            }
+        }
+        // Playback streams are not real PipeWire volume nodes: `wpctl
+        // get-volume` reports 0 for them, and using that as the fader would
+        // mute the stream as soon as it is panned. The Pulse sink-input
+        // volume is authoritative instead.
+        let map = self.refresh_pulse(fresh).await;
+        if let Some(peak) = map.get(&id).and_then(|p| p.peak) {
+            return peak;
+        }
+        pw::get_volume(id).await.unwrap_or(1.0)
+    }
+
+    /// Write the fader level and the current pan for one input. The fader
+    /// value is the *near* channel's gain, so `wpctl status` (which reports
+    /// the loudest channel) keeps showing the level the user set.
+    async fn apply_gains(&self, id: u32, base: f32) -> Result<(bool, Option<usize>)> {
+        let (name, _) = self
+            .cached_node(id)
+            .ok_or_else(|| anyhow!("input not found"))?;
+        let pan = self.pan_of(&name);
+        let (gl, gr) = pan.gains();
+        let want = (base * gl, base * gr);
+        let map = self.refresh_pulse(false).await;
+        let channels = map.get(&id).map(|p| p.channel_count());
+        let panned = pw::set_node_gains(id, want.0, want.1, base, &map).await?;
+        self.applied_gains
+            .lock()
+            .unwrap()
+            .insert(id, (want.0, want.1, base));
+        Ok((panned, channels))
+    }
+
+    /// Apply saved placements to every input, and reapply when the graph
+    /// resets a node's volume. Called from the poll loop.
+    async fn sync_pan(&self, inputs: &[pw::Node]) {
+        let current_ids: Vec<u32> = inputs.iter().map(|n| n.id).collect();
+        let changed = {
+            let mut ids = self.input_ids.lock().unwrap();
+            if *ids == current_ids {
+                false
+            } else {
+                *ids = current_ids;
+                true
+            }
+        };
+        if inputs.is_empty() {
+            self.applied_gains.lock().unwrap().clear();
+            return;
+        }
+
+        let mut map = self.refresh_pulse(changed).await;
+        let pans = self.cfg.lock().unwrap().pan.clone();
+        // A graph or stream restart can restore a flat volume after we have
+        // already applied a pan. Reassert occasionally so a long-lived session
+        // cannot silently drift back to centre.
+        let reassert = {
+            let mut at = self.pan_at.lock().unwrap();
+            let due = at.elapsed() >= Duration::from_secs(15);
+            if due {
+                *at = Instant::now();
+            }
+            due
+        };
+
+        let mut pending: Vec<(u32, f32, f32, f32)> = Vec::new();
+        {
+            let applied = self.applied_gains.lock().unwrap();
+            for n in inputs {
+                let pan = pans.get(&n.name).copied().unwrap_or_default();
+                let (gl, gr) = pan.gains();
+                let applied_entry = applied.get(&n.id);
+                let needs_reassert = reassert && pan.x.abs() > 0.001;
+                // Leave untouched, centred inputs alone. Writing both channels
+                // to the peak here would flatten a stereo source's balance
+                // before the user has done anything.
+                if !needs_reassert && pan.x.abs() <= 0.001 && applied_entry.is_none() {
+                    continue;
+                }
+                let base = match n.vol {
+                    Some(v) => Some(pw::from_pw(v as f32)),
+                    // `wpctl status` omits the volume for streams and some
+                    // sources. Reuse the level we last wrote, then fall back
+                    // to the Pulse volume (streams) before re-reading wpctl.
+                    None if needs_reassert => None,
+                    None => applied_entry
+                        .map(|&(_, _, b)| b)
+                        .or_else(|| map.get(&n.id).and_then(|p| p.peak)),
+                };
+                let Some(base) = base else {
+                    pending.push((n.id, gl, gr, -1.0));
+                    continue;
+                };
+                let want = (base * gl, base * gr);
+                let stale = applied_entry
+                    .map(|&(l, r, _)| (l - want.0).abs() > 0.002 || (r - want.1).abs() > 0.002)
+                    .unwrap_or(true);
+                if stale || needs_reassert {
+                    pending.push((n.id, gl, gr, base));
+                }
+            }
+        }
+        let live: std::collections::HashSet<u32> = inputs.iter().map(|n| n.id).collect();
+        self.applied_gains
+            .lock()
+            .unwrap()
+            .retain(|id, _| live.contains(id));
+
+        if pending.is_empty() {
+            return;
+        }
+        if pending.iter().any(|(id, _, _, _)| !map.contains_key(id)) {
+            map = self.refresh_pulse(true).await;
+        }
+
+        for (id, gl, gr, base) in pending {
+            let base = if base < 0.0 {
+                self.base_volume(id, None, true).await
+            } else {
+                base
+            };
+            let want = (base * gl, base * gr);
+            if let Err(e) = pw::set_node_gains(id, want.0, want.1, base, &map).await {
+                eprintln!("warning: cannot set direction for node {id}: {e}");
+            }
+            self.applied_gains
+                .lock()
+                .unwrap()
+                .insert(id, (want.0, want.1, base));
+        }
+    }
+
+    async fn node_by_id(&self, id: u32) -> Option<pw::Node> {
+        let (nodes, _) = self.nodes().await;
+        nodes.into_iter().find(|n| n.id == id)
+    }
+
     fn wireplumber_version(&self) -> String {
         self.version.lock().unwrap().clone()
     }
@@ -454,20 +698,34 @@ impl App {
             .filter(|n| n.kind == "source" || n.kind == "stream")
             .cloned()
             .collect();
+        *self.node_cache.lock().unwrap() = nodes
+            .iter()
+            .map(|n| (n.id, (n.name.clone(), n.vol)))
+            .collect();
         self.apply_mutes(&inputs).await;
+        self.sync_pan(&inputs).await;
         let selected = self.selected_output(&nodes);
         self.apply_master(selected).await;
 
         let solo = *self.solo.lock().unwrap();
+        let pulse = self.pulse_map.lock().unwrap().clone();
         let cfg = self.cfg.lock().unwrap();
         let jnode = |n: &pw::Node| {
+            let pan = cfg.pan.get(&n.name).copied().unwrap_or_default();
+            let channels = pulse.get(&n.id).map(|p| p.channel_count());
+            let vol = n
+                .vol
+                .map(|v| pw::from_pw(v as f32))
+                .or_else(|| pulse.get(&n.id).and_then(|p| p.peak));
             json!({
                 "id": n.id,
                 "name": n.name,
-                "vol": n.vol.map(|v| pw::from_pw(v as f32)),
+                "vol": vol,
                 "muted": n.muted || cfg.mute.get(&n.name).copied().unwrap_or(false),
                 "default": n.default,
                 "bluetooth": n.bluetooth,
+                "pan": pan,
+                "channels": channels,
             })
         };
 
@@ -514,7 +772,46 @@ impl App {
         let b = |k: &str| cmd.get(k).and_then(Value::as_bool).unwrap_or(false);
 
         match c("cmd").as_str() {
-            "vol" => pw::set_volume(n("id"), f("vol")).await?,
+            "vol" => {
+                let id = n("id");
+                let vol = f("vol").clamp(0.0, pw::MAX_GAIN);
+                if self.cached_node(id).is_some() {
+                    self.apply_gains(id, vol).await?;
+                } else {
+                    pw::set_volume(id, vol).await?;
+                }
+            }
+            "pan" => {
+                let id = n("id");
+                let pan = Pan {
+                    x: f("x"),
+                    y: f("y"),
+                }
+                .normalized();
+                let (name, vol) = match self.cached_node(id) {
+                    Some(v) => v,
+                    None => {
+                        let node = self
+                            .node_by_id(id)
+                            .await
+                            .ok_or_else(|| anyhow!("input not found"))?;
+                        self.node_cache
+                            .lock()
+                            .unwrap()
+                            .insert(id, (node.name.clone(), node.vol));
+                        (node.name, node.vol)
+                    }
+                };
+                let base = self.base_volume(id, vol, b("final")).await;
+                self.cfg.lock().unwrap().pan.insert(name, pan);
+                if b("final") {
+                    self.save()?;
+                }
+                let (_, channels) = self.apply_gains(id, base).await?;
+                if b("final") && channels.is_some_and(|c| c < 2) {
+                    return Ok("this input is mono; stereo direction is unavailable".into());
+                }
+            }
             "mute" => {
                 let name = self.name_of(n("id")).await;
                 self.cfg.lock().unwrap().mute.insert(name, b("on"));
@@ -676,6 +973,31 @@ mod chrono_stub {
                 y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pan;
+
+    #[test]
+    fn centre_is_unity_and_sides_attenuate_the_far_channel() {
+        assert_eq!(Pan::default().gains(), (1.0, 1.0));
+        assert_eq!((Pan { x: -1.0, y: 0.0 }).gains(), (1.0, 0.0));
+        assert_eq!((Pan { x: 1.0, y: 0.0 }).gains(), (0.0, 1.0));
+        assert_eq!((Pan { x: 0.5, y: 0.0 }).gains(), (0.5, 1.0));
+        // Front/back must not collapse the stereo image or alter the level.
+        assert_eq!((Pan { x: 0.0, y: 1.0 }).gains(), (1.0, 1.0));
+    }
+
+    #[test]
+    fn positions_are_clamped_to_the_unit_circle() {
+        let p = (Pan { x: 2.0, y: 0.0 }).normalized();
+        assert!((p.x - 1.0).abs() < 1e-6 && p.y.abs() < 1e-6);
+        assert_eq!(
+            (Pan { x: f32::NAN, y: 0.0 }).normalized(),
+            Pan::default()
+        );
     }
 }
 

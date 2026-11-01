@@ -43,6 +43,37 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .pill{font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums}
 .vol{font-size:11px;color:var(--dim);width:34px;text-align:right;font-variant-numeric:tabular-nums}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.inputrow{flex-wrap:wrap}
+.pangroup{display:flex;align-items:center;gap:3px;flex:none}
+.panpad{position:relative;width:46px;height:46px;flex:none;border-radius:50%;
+  border:1px solid var(--line);background:var(--panel2);cursor:grab;padding:0;
+  appearance:none;-webkit-appearance:none;
+  touch-action:none;user-select:none;-webkit-user-select:none}
+.panpad::before{content:"";position:absolute;inset:7px;border-radius:50%;
+  border:1px dashed #344052;pointer-events:none}
+.panpad::after{content:"";position:absolute;left:50%;top:50%;width:3px;height:3px;
+  margin:-1.5px;border-radius:50%;background:var(--dim);opacity:.7;pointer-events:none}
+.panpad:active{cursor:grabbing}
+.panpad.disabled{opacity:.35;cursor:not-allowed}
+.panpad.disabled:active{cursor:not-allowed}
+.pandot{position:absolute;left:50%;top:50%;width:11px;height:11px;margin:-5.5px;
+  border-radius:50%;background:var(--accent);box-shadow:0 0 7px var(--accent);
+  pointer-events:none;transition:transform .05s linear}
+.pantag{font-size:10px;color:var(--dim);min-width:38px;text-align:center;
+  font-variant-numeric:tabular-nums}
+.panreset{width:24px;height:24px;padding:0;line-height:1;font-size:13px;flex:none;
+  border-radius:50%;color:var(--dim)}
+.panreset:hover:not(:disabled){color:var(--fg);border-color:#46536b}
+.sectionhead{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.sectionhead button{text-transform:none;letter-spacing:0}
+@media(max-width:700px){
+  /* On a phone the name gets its own line so it is not truncated to a few
+     characters; the fader then expands across the second line. */
+  .inputrow .name{flex:1 1 calc(100% - 95px)}
+  .inputrow input[type=range]{width:auto;min-width:80px;flex:1 1 120px}
+  .panpad{width:40px;height:40px}
+  .pantag{min-width:30px}
+}
 #toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#21262d;
   border:1px solid var(--line);border-left:3px solid var(--blue);padding:8px 14px;
   border-radius:6px;max-width:80vw;opacity:0;transition:opacity .25s;pointer-events:none;z-index:9}
@@ -65,8 +96,13 @@ select,input[type=text]{background:var(--panel2);color:var(--fg);border:1px soli
 <main>
 <div>
   <section>
-    <h2>Inputs &mdash; mixed together</h2>
+    <h2 class="sectionhead">Inputs &mdash; mixed together
+      <button type="button" onclick="panResetAll()" title="Centre the direction of every source">Reset all</button>
+    </h2>
     <div id="inputs"></div>
+    <p class="empty">Drag a source's dot around its circle to place it. Double-click a pad or press
+       its &#8634; button to centre it. Stereo output renders left/right; the vertical position keeps
+       the stage readable.</p>
   </section>
 
   <section>
@@ -579,6 +615,120 @@ function setHTML(sel, html, key){
   $(sel).innerHTML = html;
 }
 
+// ---- direction pads -------------------------------------------------------
+// Each input gets a small sound-stage pad. The dot is constrained to the ring;
+// its horizontal component is the stereo pan. The server writes that pan as
+// per-channel gains before the mix, so it reaches every output (Bluetooth and
+// the browser capture) and never collapses a stereo source to mono.
+let panDrag = null;
+const panHold = {};    // id -> timestamp until which a server push must not snap the dot back
+const panSendT = {};   // id -> pending throttled command
+
+// Keep the dot on the dashed ring regardless of the pad's CSS size.
+function panRadius(el){
+  return Math.max(6, el.clientWidth / 2 - 7);
+}
+function setPanDot(el, x, y){
+  const dot = el.querySelector('.pandot');
+  if (dot) {
+    const r = panRadius(el);
+    dot.style.transform = `translate(${(x * r).toFixed(1)}px,${(y * r).toFixed(1)}px)`;
+  }
+}
+function setPanTag(id, x){
+  const el = document.querySelector(`[data-pantag="${id}"]`);
+  if (!el) return;
+  const v = Math.round(Math.abs(x) * 100);
+  el.textContent = v < 5 ? 'C' : (x < 0 ? 'L ' : 'R ') + v;
+}
+function panStart(e, el){
+  if (el.classList.contains('disabled')) return;
+  if (e.button !== undefined && e.button !== 0) return;
+  // Do not preventDefault here: it would also suppress the dblclick used to
+  // centre the source. `touch-action:none` and user-select handle scrolling
+  // and selection instead.
+  panDrag = el;
+  try{ el.setPointerCapture(e.pointerId); }catch(_){}
+  el.onpointermove = ev => panMove(ev, el);
+  el.onpointerup = ev => panEnd(ev, el);
+  el.onpointercancel = ev => panEnd(ev, el);
+  panMove(e, el);
+}
+function panMove(e, el){
+  if (panDrag !== el) return;
+  const r = el.getBoundingClientRect();
+  let dx = (e.clientX - (r.left + r.width / 2)) / (r.width / 2);
+  let dy = (e.clientY - (r.top + r.height / 2)) / (r.height / 2);
+  const len = Math.hypot(dx, dy);
+  // Keep the previous angle when the pointer is close to the centre; a click
+  // in the middle should not spin the source to an arbitrary direction.
+  if (len < 0.18) return;
+  dx /= len; dy /= len;
+  const id = +el.dataset.id;
+  el.dataset.x = dx; el.dataset.y = dy;
+  setPanDot(el, dx, dy);
+  setPanTag(id, dx);
+  panHold[id] = Date.now() + 1500;
+  sendPan(id, dx, dy, false);
+}
+function panEnd(e, el){
+  if (panDrag !== el) return;
+  const id = +el.dataset.id;
+  const x = +(el.dataset.x ?? 0), y = +(el.dataset.y ?? -1);
+  try{ el.releasePointerCapture(e.pointerId); }catch(_){}
+  el.onpointermove = el.onpointerup = el.onpointercancel = null;
+  panDrag = null;
+  panHold[id] = Date.now() + 1500;
+  sendPan(id, x, y, true);
+}
+function panCenter(id){
+  const el = document.querySelector(`.panpad[data-id="${id}"]`);
+  if (!el || el.classList.contains('disabled')) return;
+  el.dataset.x = 0; el.dataset.y = -1;
+  setPanDot(el, 0, -1);
+  setPanTag(id, 0);
+  panHold[id] = Date.now() + 1500;
+  sendPan(id, 0, -1, true);
+}
+function panResetAll(){
+  for (const n of (S && S.inputs) || []){
+    if (n.channels != null && n.channels < 2) continue;   // mono sources cannot pan
+    panCenter(n.id);
+  }
+}
+function sendPan(id, x, y, final){
+  if (final){
+    clearTimeout(panSendT[id]); delete panSendT[id];
+    send({ cmd: 'pan', id, x, y, final: true });
+    return;
+  }
+  // One command per ~120 ms is enough to hear the move while dragging; the
+  // pointerup event always sends the exact final position.
+  if (panSendT[id]) return;
+  send({ cmd: 'pan', id, x, y });
+  panSendT[id] = setTimeout(() => { delete panSendT[id]; }, 120);
+}
+function renderPans(ins){
+  for (const n of ins){
+    const el = document.querySelector(`.panpad[data-id="${n.id}"]`);
+    if (!el) continue;
+    const mono = n.channels != null && n.channels < 2;
+    el.classList.toggle('disabled', mono);
+    const reset = document.querySelector(`.panreset[data-id="${n.id}"]`);
+    if (reset) reset.disabled = mono;
+    el.title = mono
+      ? 'Mono source — stereo direction needs at least 2 channels'
+      : 'Drag to place this source in the stereo field (double-click to centre)';
+    // Do not fight the user's finger (or the command still in flight).
+    if (panDrag === el || Date.now() < (panHold[n.id] || 0)) continue;
+    let p = n.pan || { x: 0, y: -1 };
+    if (Math.hypot(p.x || 0, p.y || 0) < 0.01) p = { x: 0, y: -1 };
+    el.dataset.x = p.x; el.dataset.y = p.y;
+    setPanDot(el, p.x, p.y);
+    setPanTag(n.id, p.x);
+  }
+}
+
 function render(s){
   S = s;
   $('#live').className = 'dot ' + (s.ok ? 'ok' : 'bad');
@@ -590,15 +740,28 @@ function render(s){
   // inputs
   const ins = s.inputs || [];
   setHTML('#inputs', ins.length ? ins.map(n => `
-    <div class="row">
+    <div class="row inputrow">
       <span class="name" title="${esc(n.name)}">${esc(n.name)}</span>
       ${n.bluetooth ? '<span class="tag bt">A2DP</span>' : ''}
+      <div class="pangroup">
+        <button type="button" class="panpad" data-id="${n.id}" title="Drag to place this source"
+             aria-label="Direction: ${esc(n.name)}"
+             onpointerdown="panStart(event,this)" ondblclick="panCenter(${n.id})">
+          <span class="pandot"></span>
+        </button>
+        <span class="pantag" data-pantag="${n.id}">C</span>
+        <button type="button" class="panreset" data-id="${n.id}"
+                title="Reset direction to centre"
+                aria-label="Reset direction: ${esc(n.name)}"
+                onclick="panCenter(${n.id})">&#8634;</button>
+      </div>
       <input type="range" min="0" max="100" value="${Math.round((n.vol ?? 1) * 100)}"
              ${n.muted ? 'disabled' : ''} oninput="vol(${n.id},this)">
       <span class="vol">${pct(n.vol)}</span>
       <button class="mute ${n.muted ? 'on' : ''}" onclick="mute(${n.id},${!n.muted})">M</button>
       <button class="solo ${n.solo ? 'on' : ''}" onclick="send({cmd:'solo',id:${n.id},on:${!n.solo}})">S</button>
     </div>`).join('') : '<div class="empty">No inputs yet. Connect a Bluetooth phone or a USB/line-in device.</div>', 'inputs');
+  renderPans(ins);
 
   // outputs
   const outs = (s.outputs || []).map(n => ({

@@ -13,12 +13,18 @@
 use anyhow::{anyhow, Result};
 use pipewire as pw;
 use pw::spa;
+use serde_json::Value;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Name the capture node advertises in `pw-dump`.
 pub const NODE_NAME: &str = "btmixer-web-capture";
+
+/// Application name the capture stream reports. `wpctl status` prints this
+/// (not `NODE_NAME`) in its Streams list, so the mixer filters it out under
+/// this name as well.
+pub const APP_NAME: &str = "bluetooth-mixer";
 
 /// Format of the PCM we push over the WebSocket. The browser decodes these
 /// bytes as little-endian signed 16-bit samples, interleaved.
@@ -82,6 +88,40 @@ pub async fn ensure_sink() -> Result<u32> {
 
 pub async fn drop_sink(id: u32) {
     let _ = crate::pw::pactl(&["unload-module".into(), id.to_string()]).await;
+}
+
+/// Whether any BluetoothMixer capture stream is currently attached.
+///
+/// The web null sink is shared by every instance, so the stale-sink sweep must
+/// not remove one that another running instance is still using. A capture
+/// stream is the signal that the sink is live.
+pub async fn capture_active() -> bool {
+    let Ok(out) = crate::pw::pactl(&[
+        "-f".into(),
+        "json".into(),
+        "list".into(),
+        "source-outputs".into(),
+    ])
+    .await
+    else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&out) else {
+        return false;
+    };
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .any(is_capture_output)
+}
+
+fn is_capture_output(item: &Value) -> bool {
+    let props = item.get("properties");
+    [APP_NAME, NODE_NAME].iter().any(|want| {
+        ["application.name", "media.name", "node.name"]
+            .iter()
+            .any(|key| props.and_then(|p| p.get(*key)).and_then(Value::as_str) == Some(*want))
+    })
 }
 
 /// Attach a native libpipewire capture to the null sink's monitor ports and
@@ -166,7 +206,7 @@ fn capture_thread_inner(
         // Without this WirePlumber names the stream after the application and
         // `wpctl status` lists our own capture among the mixer inputs.
         *pw::keys::MEDIA_NAME => NODE_NAME,
-        *pw::keys::APP_NAME => "bluetooth-mixer",
+        *pw::keys::APP_NAME => APP_NAME,
         *pw::keys::NODE_NAME => NODE_NAME,
         *pw::keys::NODE_DESCRIPTION => "BluetoothMixer web capture",
         // Attach to the monitor ports of the sink rather than a source node.
@@ -315,4 +355,25 @@ async fn pump_loop(
         }
     }
     Err(anyhow!("capture stream closed"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognises_own_capture_outputs() {
+        let by_app = serde_json::json!({
+            "properties": {"application.name": APP_NAME}
+        });
+        let by_media = serde_json::json!({
+            "properties": {"media.name": NODE_NAME}
+        });
+        let other = serde_json::json!({
+            "properties": {"application.name": "some-player", "media.name": "music"}
+        });
+        assert!(is_capture_output(&by_app));
+        assert!(is_capture_output(&by_media));
+        assert!(!is_capture_output(&other));
+    }
 }

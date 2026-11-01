@@ -28,6 +28,7 @@ CLI and renders a page.
 |---|---|
 | Inputs | Bluetooth A2DP sources, USB / line-in, LAN PulseAudio clients, RTP receivers |
 | Mixing | Per-input fader, mute and solo (solo mutes every other input) |
+| Direction | Per-input stereo placement; applied before the mix, so it reaches every output |
 | Output | Pick any sink, master volume, output gain (0–400%), pairing state, one-click connect |
 | Web output | Send the mix to the browser itself instead of a speaker/headset, with a live level meter |
 | Hardware | ALSA card profile switching for USB audio interfaces |
@@ -62,9 +63,35 @@ cargo build --release
    capture stream.
 3. **Pair your headphones** and pick them in *Output*.
 4. Balance with the per-input faders; `S` solos one input, `M` mutes it.
+5. Drag an input's direction dot around its circle to place it left or right.
+   Double-click the pad to centre it.
 
 Everything PipeWire mixes automatically, and the selected output sink is the single
 point where master and gain are applied.
+
+### Directional placement
+
+Each input with at least two channels gets a circular pad. Dragging the dot
+writes a gain to the source's left and right channels before PipeWire mixes
+them, so the placement is present in every output: the selected speaker/headset
+and the browser web output alike. Moving the dot right attenuates the left
+channel and leaves the right at the fader level; moving left does the reverse.
+At centre both channels are at the fader level, so a stereo source keeps both
+channels and is never downmixed.
+
+* Only the horizontal axis affects audio. The vertical position is kept so the
+  stage is readable; there is no front/back or HRTF processing.
+* On a multichannel source, only the `front-left` / `front-right` pair is panned;
+  all other channels stay at the fader level. No channels are dropped.
+* Mono inputs cannot be placed: duplicating or downmixing them would change the
+  source's channel count, so their pad is disabled.
+* Placements are saved by input display name in
+  `~/.config/bluetooth-mixer/state.json` and reapplied when the stream
+  reconnects. Non-centred placements are also reasserted every 15 seconds so a
+  graph restart cannot silently flatten them.
+
+The fader remains the near-channel level: `wpctl status` reports the loudest
+channel, so it continues to show the value on the slider.
 
 ### Network / app sources
 
@@ -106,7 +133,7 @@ phones only run the secure-simple-pairing exchange as the initiator.
 | `src/webaudio.rs` | Null sink + native libpipewire capture, broadcast to every browser |
 | `src/agent.rs` | BlueZ `org.bluez.Agent1` pairing agent — without it, pairing cannot complete |
 | `src/bt.rs` | Wraps `bluetoothctl` |
-| `src/state.rs` | 900 ms discovery poll, solo/mute enforcement, master/gain, persistence |
+| `src/state.rs` | 900 ms discovery poll, solo/mute enforcement, direction gains, master/gain, persistence |
 | `src/web.rs` | axum: one HTML page, one WebSocket, JSON protocol |
 | `src/static/index.html` | The whole UI — no build step, no framework |
 
@@ -147,7 +174,9 @@ counters if either ever becomes non-zero — if you hear crackle, read those. To
 and puts your previous output back.
 
 There is no DSP of our own: PipeWire mixes and attenuates, this project only
-drives its CLI.
+drives its CLI. Directional placement is just per-channel volume on the input,
+written through `pactl` before the mix; it does not re-encode or downmix the
+source.
 
 ### HTTP API
 
@@ -160,7 +189,14 @@ JSON text; captured audio arrives on the same socket as binary frames:
 {"cmd":"solo","id":42,"on":true}     {"cmd":"output","id":51}
 {"cmd":"master","vol":0.7}           {"cmd":"gain","vol":1.25}
 {"cmd":"web","on":true}              {"cmd":"bt_action","action":"connect","addr":"AA:BB:.."}
+{"cmd":"pan","id":42,"x":0.7,"y":-0.7,"final":true}
 ```
+
+`pan` takes `x` and `y` on the unit circle: `x` is the stereo position (-1 hard
+left, 0 centre, +1 hard right) and `y` is visual placement only. Send
+`final:true` on the last command of a drag to persist it; intermediate commands
+can omit it. Values outside the circle are normalised. The command returns a
+message instead of applying a pan when the input is mono.
 
 ## Troubleshooting
 
@@ -177,6 +213,7 @@ JSON text; captured audio arrives on the same socket as binary frames:
 | Web output stuck on "buffering…" | The capture cannot reach the null sink: check `pactl list short sinks` shows `btmixer_web` and `wpctl status` lists a `btmixer-web-capture` stream |
 | Web output silent but meter moving | The browser tab is muted or the system output is muted |
 | Web output choppy | Too much Wi-Fi congestion: 48 kHz stereo PCM is ~1.5 Mbit/s sustained |
+| Direction pad is greyed out | The input is mono. Placement needs at least two channels; no downmix is performed |
 
 Run `cargo test` to exercise the `wpctl status` parser against the PipeWire
 0.3 (WirePlumber 0.4/0.5) and PipeWire 1.x output layouts.

@@ -4,6 +4,7 @@
 use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -77,6 +78,181 @@ pub async fn set_profile(card: u32, profile: &str) -> Result<()> {
     wpctl(&["set-profile", &card.to_string(), profile])
         .await
         .map(|_| ())
+}
+
+/// Read a node's current level in linear amplitude. `wpctl status` omits the
+/// volume for some source nodes, so this is the fallback when a fader has to
+/// be derived from the graph itself.
+pub async fn get_volume(id: u32) -> Option<f32> {
+    let out = wpctl(&["get-volume", &id.to_string()]).await.ok()?;
+    let token = out.split_whitespace().nth(1)?;
+    token.parse::<f32>().ok().map(from_pw)
+}
+
+// ---------------------------------------------------------------------------
+// Per-source panning
+// ---------------------------------------------------------------------------
+
+/// A node as the PulseAudio compatibility layer sees it. `wpctl` and
+/// `pactl` use different ids for the same object, so the map is keyed by the
+/// PipeWire object id that `wpctl status` prints; that is what the UI sends
+/// back in commands.
+#[derive(Debug, Clone)]
+pub struct PulseNode {
+    /// Pulse index used by `pactl set-sink-input-volume` / `set-source-volume`.
+    pub index: u32,
+    /// `true` for an `Audio/Source` (A2DP input, mic, virtual source).
+    pub source: bool,
+    /// Channel names in wire order (`front-left`, `front-right`, …).
+    pub channels: Vec<String>,
+    /// Loudest channel in linear amplitude. This is the level the fader
+    /// represents: panning only attenuates the far side, so the near channel
+    /// (the peak) stays at the user's chosen level. Needed for playback
+    /// streams because `wpctl get-volume` reports 0 for them.
+    pub peak: Option<f32>,
+}
+
+impl PulseNode {
+    pub fn channel_count(&self) -> usize {
+        self.channels.len()
+    }
+}
+
+/// List playback streams and sources, keyed by PipeWire node id.
+///
+/// Only the Pulse compatibility layer can set individual channel volumes
+/// without doing raw PipeWire param round-trips. Nodes that are not exposed
+/// there are absent from the map; callers fall back to `wpctl`.
+pub async fn pulse_nodes() -> Result<HashMap<u32, PulseNode>> {
+    let mut map = HashMap::new();
+    // Sink inputs first, sources second: a virtual source may also have an
+    // internal playback stream, and its source volume is the one that feeds
+    // the graph.
+    for (list, source) in [("sink-inputs", false), ("sources", true)] {
+        let out = pactl(&[
+            "-f".into(),
+            "json".into(),
+            "list".into(),
+            list.into(),
+        ])
+        .await?;
+        let v: Value = serde_json::from_str(&out)?;
+        for item in v.as_array().into_iter().flatten() {
+            let Some(index) = item.get("index").and_then(Value::as_u64) else {
+                continue;
+            };
+            let Some(id) = item
+                .pointer("/properties/object.id")
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .or_else(|| v.as_u64().map(|n| n as u32))
+                })
+            else {
+                continue;
+            };
+            let channels = item
+                .get("channel_map")
+                .and_then(Value::as_str)
+                .map(parse_channel_map)
+                .filter(|v| !v.is_empty())
+                .or_else(|| {
+                    item.get("sample_specification")
+                        .and_then(Value::as_str)
+                        .and_then(parse_spec_channels)
+                })
+                .unwrap_or_default();
+            map.insert(
+                id,
+                PulseNode {
+                    index: index as u32,
+                    source,
+                    channels,
+                    peak: parse_peak_volume(item),
+                },
+            );
+        }
+    }
+    Ok(map)
+}
+
+/// Highest channel level from a `pactl -f json` object. Pulse volume values
+/// are cubic like `wpctl`, with 65536 = unity, so they convert with
+/// [`from_pw`] after normalising.
+fn parse_peak_volume(item: &Value) -> Option<f32> {
+    item.get("volume")
+        .and_then(Value::as_object)?
+        .values()
+        .filter_map(|v| v.get("value").and_then(Value::as_f64))
+        .map(|raw| from_pw((raw / 65536.0) as f32))
+        .reduce(f32::max)
+}
+
+fn parse_channel_map(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty())
+        .collect()
+}
+
+/// Fallback for older `pactl` output that has no `channel_map`: read the
+/// channel count out of `s16le 2ch 48000Hz`.
+fn parse_spec_channels(s: &str) -> Option<Vec<String>> {
+    let n = s
+        .split_whitespace()
+        .find_map(|w| w.strip_suffix("ch").and_then(|d| d.parse::<usize>().ok()))?;
+    Some(match n {
+        0 => vec![],
+        1 => vec!["mono".into()],
+        2 => vec!["front-left".into(), "front-right".into()],
+        _ => (0..n).map(|i| format!("ch{i}")).collect(),
+    })
+}
+
+/// Set a node's channel levels in linear amplitude. Stereo (and the front
+/// pair of a multichannel node) is panned; every other channel stays at
+/// `base`, so a source never loses channels. Returns whether the pan was
+/// actually applied (false for mono or nodes invisible to PulseAudio).
+pub async fn set_node_gains(
+    id: u32,
+    left: f32,
+    right: f32,
+    base: f32,
+    nodes: &HashMap<u32, PulseNode>,
+) -> Result<bool> {
+    let Some(node) = nodes.get(&id) else {
+        set_volume(id, base).await?;
+        return Ok(false);
+    };
+    if node.channel_count() < 2 {
+        set_volume(id, base).await?;
+        return Ok(false);
+    }
+
+    let mut args = vec![
+        if node.source {
+            "set-source-volume"
+        } else {
+            "set-sink-input-volume"
+        }
+        .to_string(),
+        node.index.to_string(),
+    ];
+    args.extend(node.channels.iter().map(|c| {
+        let v = match c.as_str() {
+            "front-left" | "fl" | "left" => left,
+            "front-right" | "fr" | "right" => right,
+            _ => base,
+        };
+        format!("{:.4}", v.clamp(0.0, 10.0))
+    }));
+
+    if pactl(&args).await.is_ok() {
+        return Ok(true);
+    }
+    // Keep the fader working even if the per-channel call is rejected.
+    set_volume(id, base).await?;
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +393,7 @@ pub fn parse_status(out: &str) -> Vec<Node> {
         if rest.contains(" > ")
             || rest.contains(" < ")
             || rest.starts_with(crate::webaudio::NODE_NAME)
+            || rest.starts_with(crate::webaudio::APP_NAME)
         {
             continue;
         }
@@ -360,6 +537,9 @@ Audio
              101. input_FR        < WebOutput:monitor_FR	[active]
              108. monitor_FL
               99. input_FL        < WebOutput:monitor_FL	[active]
+       113. bluetooth-mixer
+             106. monitor_FR
+             102. input_FR        < WebOutput:monitor_FR	[active]
 ";
     const PW10: &str = "\
 PipeWire 'pipewire-0' [1.4.2, andy@raspberrypi, cookie:2845416046]
@@ -464,6 +644,41 @@ Settings
                    "only the real playback stream should be an input");
         assert!(n.iter().all(|x| !x.name.contains('>') && !x.name.contains('<')));
         assert!(!n.iter().any(|x| x.name.starts_with(crate::webaudio::NODE_NAME)));
+        assert!(!n.iter().any(|x| x.name.starts_with(crate::webaudio::APP_NAME)));
+    }
+
+    #[test]
+    fn parses_peak_volume_from_pulse_json() {
+        let item = serde_json::json!({
+            "volume": {
+                "front-left": {"value": 0},
+                "front-right": {"value": 60838}
+            }
+        });
+        let peak = parse_peak_volume(&item).unwrap();
+        assert!((peak - 0.8).abs() < 0.001, "peak was {peak}");
+        assert_eq!(parse_peak_volume(&serde_json::json!({})), None);
+        assert_eq!(
+            parse_peak_volume(&serde_json::json!({"volume": {}})),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_channel_maps_for_panning() {
+        assert_eq!(
+            parse_channel_map("front-left,front-right"),
+            vec!["front-left", "front-right"]
+        );
+        assert_eq!(
+            parse_spec_channels("s16le 2ch 48000Hz"),
+            Some(vec!["front-left".into(), "front-right".into()])
+        );
+        assert_eq!(
+            parse_spec_channels("float32le 1ch 48000Hz"),
+            Some(vec!["mono".into()])
+        );
+        assert_eq!(parse_spec_channels("s16le 48000Hz"), None);
     }
 
     #[test]
